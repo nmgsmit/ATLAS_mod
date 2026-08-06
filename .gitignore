@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.ipynb_checkpoints/
+.DS_Store
+
+# large data, generated per-machine
+workspace/
+raw-videos/
+raw_videos/
+gui/weights/

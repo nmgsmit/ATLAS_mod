@@ -14,8 +14,9 @@ if not hasattr(Image, 'Resampling'):  # Pillow<9.0
     Image.Resampling = Image
 import numpy as np
 
+from gui import border_crop
 from gui.cutie.utils.palette import custom_palette
-from gui.gui_utils import workspace_name_for_video
+from gui.gui_utils import video_roots, workspace_name_for_video
 from tqdm import tqdm
 
 log = logging.getLogger()
@@ -60,6 +61,9 @@ class ResourceManager:
         video = cfg['video']
         self.workspace = cfg['workspace']
         self.max_size = cfg.get('max_overall_size', None)
+        # Endoscope recordings are letterboxed; the padding is not picture. Cut once, at
+        # extraction, so nothing downstream ever sees it (gui/border_crop.py).
+        self.crop_borders = bool(cfg.get('crop_borders', True))
         self.palette = custom_palette
 
         # create temporary workspace if not specified
@@ -67,7 +71,9 @@ class ResourceManager:
             if images is not None:
                 basename = path.basename(images)
             elif video is not None:
-                basename = workspace_name_for_video(video, cfg.get('raw_videos_root'))
+                basename = workspace_name_for_video(
+                    video, video_roots(cfg.get('raw_videos_root'),
+                                       cfg.get('extra_video_roots')))
             else:
                 raise NotImplementedError('Either images, video, or workspace has to be specified')
 
@@ -126,6 +132,8 @@ class ResourceManager:
         print(f'{self.length} images found.')
 
         self.height, self.width = self.get_image(0).shape[:2]
+        self.crop_info = border_crop.load(self.workspace)
+        self._warn_uncropped()
 
         # create the saver threads for saving the masks/visualizations
         self.save_queue = Queue(maxsize=cfg['save_queue_size'])
@@ -197,41 +205,86 @@ class ResourceManager:
                 raise NotImplementedError
             queue.task_done()
 
+    def _shrink(self, frame):
+        """max_overall_size applied to one frame. Runs AFTER cropping, so the short edge
+        it scales to is a short edge of the picture and not of the padding."""
+        h, w = frame.shape[:2]
+        if self.max_size > 0 and min(h, w) > self.max_size:
+            new_w = (w * self.max_size // min(w, h))
+            new_h = (h * self.max_size // min(w, h))
+            frame = cv2.resize(frame, dsize=(new_w, new_h), interpolation=cv2.INTER_AREA)
+        return frame
+
+    def _crop_box(self, source_size, source: str):
+        """The black-bar crop for a source of this (w, h), announced. None = nothing to
+        cut. One fixed box for the whole sequence, so the picture cannot wander."""
+        box = border_crop.crop_for(source_size) if self.crop_borders else None
+        print(f'{path.basename(source)}: {border_crop.describe(box, source_size)}')
+        return box
+
     def _extract_frames(self, video: str):
         cap = cv2.VideoCapture(video)
         frame_index = 0
+        box = source_size = out_size = None
         print(f'Extracting frames from {video} into {self.image_dir}...')
         with tqdm() as bar:
             while (cap.isOpened()):
                 _, frame = cap.read()
                 if frame is None:
                     break
-                h, w = frame.shape[:2]
-                if self.max_size > 0 and min(h, w) > self.max_size:
-                    new_w = (w * self.max_size // min(w, h))
-                    new_h = (h * self.max_size // min(w, h))
-                    frame = cv2.resize(frame, dsize=(new_w, new_h), interpolation=cv2.INTER_AREA)
+                if source_size is None:
+                    source_size = (frame.shape[1], frame.shape[0])
+                    box = self._crop_box(source_size, video)
+                frame = self._shrink(border_crop.apply_crop(frame, box))
+                if out_size is None:
+                    out_size = (frame.shape[1], frame.shape[0])
                 cv2.imwrite(path.join(self.image_dir, f'{frame_index:07d}.jpg'), frame)
                 frame_index += 1
                 bar.update()
+        cap.release()
+        if source_size is not None:
+            border_crop.save(self.workspace, box, source_size, out_size)
         print('Done!')
 
     def _copy_resize_frames(self, images: str):
-        image_list = os.listdir(images)
+        image_list = sorted(os.listdir(images))
+        first = cv2.imread(path.join(images, image_list[0])) if image_list else None
+        box = None if first is None else self._crop_box((first.shape[1], first.shape[0]), images)
         print(f'Copying/resizing frames into {self.image_dir}...')
+        source_size = out_size = None
         for image_name in tqdm(image_list):
-            if self.max_size < 0:
-                # just copy
+            if self.max_size < 0 and box is None:
+                # nothing to do to it: just copy
                 shutil.copy2(path.join(images, image_name), self.image_dir)
             else:
                 frame = cv2.imread(path.join(images, image_name))
-                h, w = frame.shape[:2]
-                if self.max_size > 0 and min(h, w) > self.max_size:
-                    new_w = (w * self.max_size // min(w, h))
-                    new_h = (h * self.max_size // min(w, h))
-                    frame = cv2.resize(frame, dsize=(new_w, new_h), interpolation=cv2.INTER_AREA)
+                if frame is None:
+                    continue
+                if source_size is None:
+                    source_size = (frame.shape[1], frame.shape[0])
+                frame = self._shrink(border_crop.apply_crop(frame, box))
+                if out_size is None:
+                    out_size = (frame.shape[1], frame.shape[0])
                 cv2.imwrite(path.join(self.image_dir, image_name), frame)
+        if source_size is not None:
+            border_crop.save(self.workspace, box, source_size, out_size)
         print('Done!')
+
+    def _warn_uncropped(self):
+        """An existing workspace was extracted before the bars were being cut (or with
+        cropping off). Say so rather than let a padded picture look intentional: the
+        border is where gui/robot_arm.py pins the arm's centerline, so bars there quietly
+        break it. Re-extracting means deleting the images folder, which also invalidates
+        any masks drawn on it -- so this only ever warns."""
+        if not self.crop_borders or border_crop.load(self.workspace) is not None:
+            return
+        if self.width / self.height < 1.5:      # picture-shaped already (1340x1072 is 1.25)
+            return
+        print(f'WARNING: {self.workspace}/images is {self.width}x{self.height}, still the '
+              'padded 16:9 shape -- it was extracted before border cropping. Delete the '
+              'images folder and reopen the video to re-extract -- note that any '
+              'masks/annotations already drawn on these frames are in the OLD coordinates '
+              'and will not line up.')
 
     def add_to_queue_with_warning(self, item: SaveItem):
         if self.save_queue.full():

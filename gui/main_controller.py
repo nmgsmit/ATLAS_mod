@@ -5,7 +5,7 @@ from typing import Literal, Optional
 
 import cv2
 # fix conflicts between qt5 and cv2
-os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH")
+os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
 
 import torch
 try:
@@ -29,10 +29,11 @@ from gui.reader import PropagationReader, get_data_loader
 from gui.exporter import convert_frames_to_video, convert_mask_to_binary
 from gui.cutie.utils.download_models import download_models_if_needed
 
-from gui.cutie.utils.palette import custom_palette_np # added
+from gui.cutie.utils.palette import custom_names, custom_palette_np # added
 from gui import retzius_arch
+from gui import robot_arm
 from gui import scale_objects
-from gui.gui_utils import workspace_name_for_video
+from gui.gui_utils import video_roots, workspace_name_for_video
 
 log = logging.getLogger()
 
@@ -52,7 +53,9 @@ class MainController():
             if cfg["images"] is not None:
                 basename = path.basename(cfg["images"])
             elif cfg["video"] is not None:
-                basename = workspace_name_for_video(cfg["video"], cfg.get('raw_videos_root'))
+                basename = workspace_name_for_video(
+                    cfg["video"], video_roots(cfg.get('raw_videos_root'),
+                                              cfg.get('extra_video_roots')))
             else:
                 raise NotImplementedError('Either images, video, or workspace has to be specified')
 
@@ -135,8 +138,22 @@ class MainController():
         self._scale_track_dir = None    # which TRACK button is lit during that run
         self._syncing_scale = False     # guards the mm box <-> object feedback loop
         self._scale_states = []         # per-object tracking state, live during a run
-        # {frame: {class_id: ScaleLine}} and the per-class real length in mm
-        self.scale_by_frame, self.scale_mm = scale_objects.load(self.res_man.workspace)
+        # Robot arm (class 3) is not one of those: it is four points guessed off the
+        # segmentation rather than a drawn segment, so it has its own tracker state.
+        self.arm_drag = None            # 'e0'|'e1'|'t0'|'t1' while that point is dragged
+        self._arm_comp = None           # (frame, HxW bool) cache of the arm's mask blob,
+                                        # so the overlay does not re-run the components
+        self._arm_tried = set()         # frames already auto-measured, so a frame with no
+                                        # arm on it is not re-attempted on every redraw
+        self._arm_state = None          # the arm's tracking state, live during a TRACK run
+        # {frame: {class_id: ScaleLine}}, per-class mm, {frame: ArmMeasure}, and the seed
+        # click that says WHICH instrument is the arm.
+        (self.scale_by_frame, self.scale_mm, self.arm_by_frame, self.arm_seed,
+         self.arm_calib) = scale_objects.load(self.res_man.workspace)
+        # the clip-level reconciliation: what is actually exported, and the summary the
+        # readout shows. Rebuilt from the per-frame measurements, never persisted.
+        self._arm_summary = None
+        self._arm_reconcile()
 
         self.load_current_image_mask()
         self.show_current_frame()
@@ -651,25 +668,29 @@ class MainController():
             self.gui.text('Finish or pause the current run before switching mode.')
             return
         old = self._mode()
+        # ponytail: sync the page/dropdown FIRST and even for a no-op switch. The flags and
+        # the visible page must never be able to drift apart -- if a switch aborted halfway
+        # (a failed save below), re-picking the mode is what puts the GUI back.
+        self.gui.set_mode_index(MODE_INDEX[mode])
         if mode == old:
             return
-        if old == 'arch':                    # leave: freeze what is drawn, drop the handles
-            self.arch_mode = False
-            self.arch_pending = []
-            self.arch_drag = None
-            self._save_arches()
-        elif old == 'scale':
-            self.scale_mode = False
-            self.scale_pending = []
-            self.scale_drag = None
-            self._save_scales()
-        if mode in ('arch', 'scale'):
+        self.arch_mode = mode == 'arch'      # flags before any I/O, so a save that raises
+        self.scale_mode = mode == 'scale'    # cannot leave the tool half-active
+        if mode != 'mask':
             self.measure_mode = None         # the tool takes over the clicks
             self.measure_points = []
-            self.arch_mode = mode == 'arch'
-            self.scale_mode = mode == 'scale'
-        self.gui.set_mode_index(MODE_INDEX[mode])
-        self.show_current_frame()
+        try:
+            if old == 'arch':                # leave: freeze what is drawn, drop the handles
+                self.arch_pending = []
+                self.arch_drag = None
+                self._save_arches()
+            elif old == 'scale':
+                self.scale_pending = []
+                self.scale_drag = None
+                self._save_scales()
+        except Exception as e:               # a failed write must not skip the redraw below,
+            self.gui.text(f'Warning: could not save {old} annotations: {e}')
+        self.show_current_frame()            # or the old tool's handles stay on the canvas
         self.gui.text(self._mode_hint(mode))
 
     def _mode_hint(self, mode):
@@ -683,6 +704,8 @@ class MainController():
                     'urethra (the tip snaps to the mid-line and may go past the image '
                     'border). Right-click undoes. Then TRACK to carry it through the video.')
         if mode == 'scale':
+            if self.scale_class == scale_objects.ARM_CLASS:
+                return self._arm_hint()
             return (f'SCALE: drawing "{scale_objects.class_name(self.scale_class)}" '
                     f'({self._scale_mm(self.scale_class):g} mm). Left-click its two ends; '
                     'drag the end handles to correct. Pick another reference with the '
@@ -991,11 +1014,15 @@ class MainController():
         return self.scale_by_frame.get(ti, {})
 
     def _scale_lines(self, ti):
-        return list(self._scale_frame(ti).values())
+        """The hand-drawn references on frame ti. The robot arm is not among them: it is
+        measured off the mask (self.arm_by_frame), not drawn, so it has no ScaleLine to
+        drag and none of the drawing/tracking code below should see one."""
+        return [l for c, l in self._scale_frame(ti).items() if c != scale_objects.ARM_CLASS]
 
     def _save_scales(self):
         scale_objects.save(self.res_man.workspace, self.scale_by_frame, self.scale_mm,
-                           self.w, self.h)
+                           self.w, self.h, self.arm_by_frame, self.arm_seed,
+                           self.arm_calib)
 
     def on_scale_class(self, cls_id: int):
         """Pick the reference the clicks and keys apply to (buttons / keys 1-3 / [ ])."""
@@ -1003,10 +1030,29 @@ class MainController():
             return
         self.scale_class = int(cls_id)
         self.scale_pending = []         # a half-drawn object belongs to the old class
+        self.arm_drag = None
         self.gui.set_scale_class_id(self.scale_class)
         self._draw_scale_overlay()
+        if self.scale_class == scale_objects.ARM_CLASS:
+            self.gui.text(self._arm_hint())
+            return
         self.gui.text(f'Reference: {scale_objects.class_name(self.scale_class)} '
                       f'({self._scale_mm(self.scale_class):g} mm).')
+
+    def _arm_hint(self):
+        return (f'ROBOT ARM ({robot_arm.ARM_MM:g} mm across): FOUR POINTS -- the two where '
+                'the arm enters the picture, and the two at the end of its straight shaft '
+                '(the wrist, NOT the tip of the tool). 1) Left-click the arm (its '
+                f'"{custom_names[robot_arm.ARM_OBJECT_ID]}" mask, segmented and propagated '
+                'like any other object) to say which instrument it is: the four points are '
+                'guessed off that mask. 2) Drag any of the four squares that landed in the '
+                'wrong place -- the centerline runs between the pairs and the white scale '
+                'line is the diameter, square to it, which is what gets exported. 3) TRACK '
+                'carries the four points through the video (a frame you correct becomes a '
+                'keyframe), or MEASURE CLIP re-guesses every frame off its mask. Then: D '
+                '(or right-click) drops a frame you do not believe, and CALIB is the one '
+                'knob for a segmentation that is fat or thin on EVERY frame -- the readout '
+                'compares the arm against your ruler where both are drawn.')
 
     def on_scale_edit_points(self, on: bool):
         """Arm/disarm dragging of the interior tracking points. Off by default: normally
@@ -1036,6 +1082,9 @@ class MainController():
     def _scale_click(self, action, x, y):
         # handles are grabbed in image coords; shrink the radius when zoomed in so the
         # on-screen grab distance stays roughly constant
+        if self.scale_class == scale_objects.ARM_CLASS:
+            self._arm_click(action, x, y)
+            return
         lines = self._scale_lines(self.curr_ti)
         grab = max(4.0, scale_objects.GRAB_PX / self.gui.zoom)
         hit = scale_objects.hit_test(lines, x, y, grab, self.scale_edit_points)
@@ -1074,8 +1123,10 @@ class MainController():
             self.gui.text('RESET REFERENCE: wait for the run to finish or pause it first.')
             return
         cls_id = self.scale_class
+        arm = cls_id == scale_objects.ARM_CLASS
         name = scale_objects.class_name(cls_id)
-        frames = [ti for ti, objs in self.scale_by_frame.items() if cls_id in objs]
+        frames = (sorted(self.arm_by_frame) if arm else
+                  [ti for ti, objs in self.scale_by_frame.items() if cls_id in objs])
         if not frames:
             self.gui.text(f'No {name} to reset.')
             return
@@ -1084,28 +1135,49 @@ class MainController():
         if scope is None:
             return
         for ti in ([self.curr_ti] if scope == 'frame' else frames):
-            self.scale_by_frame.get(ti, {}).pop(cls_id, None)
+            if arm:
+                self.arm_by_frame.pop(ti, None)
+            else:
+                self.scale_by_frame.get(ti, {}).pop(cls_id, None)
         self.scale_by_frame = {ti: objs for ti, objs in self.scale_by_frame.items() if objs}
+        if arm and scope != 'frame':
+            self.arm_seed = None        # a full reset forgets which instrument was the arm
+        self._arm_comp = None
+        self._arm_tried = set()
         self.scale_pending = []
         self.scale_drag = None
+        self.arm_drag = None
         self._save_scales()
         self.show_current_frame()       # stays in scale mode: draw the new one right away
         self.gui.text(f'{name} cleared on '
                       + (f'frame {self.curr_ti}.' if scope == 'frame'
                          else f'all {len(frames)} frame(s).')
-                      + ' Draw a new one by clicking its two ends.')
+                      + (' Click the arm to measure it again.' if arm else
+                         ' Draw a new one by clicking its two ends.'))
 
     def _sync_scale_widgets(self):
         # keep the mm box and the readout showing the active reference on this frame
         cls_id = self.scale_class
         spec = scale_objects.CLASSES[cls_id]
+        arm = cls_id == scale_objects.ARM_CLASS
         line = self._scale_frame(self.curr_ti).get(cls_id)
         self._syncing_scale = True
         self.gui.scale_mm_box.setValue(self._scale_mm(cls_id))
         self.gui.scale_mm_box.setReadOnly(spec['fixed_mm'])
         self.gui.scale_mm_box.setEnabled(not spec['fixed_mm'])
+        # the tracking-point handles and the trust toggle belong to different tools:
+        # only one of the two is ever meaningful, so only one is ever enabled
+        self.gui.scale_points_check.setEnabled(not arm)
+        self.gui.arm_trust_check.setEnabled(arm)
+        self.gui.arm_measure_btn.setEnabled(arm)
+        self.gui.arm_calib_box.setEnabled(arm)
+        self.gui.arm_calib_box.setValue(float(self.arm_calib))
+        ann = self.arm_by_frame.get(self.curr_ti) if arm else None
+        self.gui.arm_trust_check.setChecked(bool(ann is not None and ann.trusted))
         self._syncing_scale = False
-        if line is None:
+        if arm:
+            self.gui.scale_info_label.setText(self._arm_readout(ann))
+        elif line is None:
             self.gui.scale_info_label.setText(f'{spec["name"]}: not drawn on this frame')
         else:
             state = '' if line.source == 'manual' else f'  [{line.source} '\
@@ -1113,6 +1185,101 @@ class MainController():
             self.gui.scale_info_label.setText(
                 f'{spec["name"]}: {line.length_px:.1f} px = {line.mm:g} mm  '
                 f'({line.mm_per_px:.4f} mm/px){state}')
+
+    def _arm_readout(self, ann):
+        """The one-line status of the robot arm on this frame.
+
+        Deliberately leads with the CLIP, not the frame: the number that matters is the
+        reconciled one, and the per-frame reading is only interesting where it disagrees
+        with its neighbours (which is the tool telling you the mask is ragged there, not
+        the arm changing width)."""
+        n = len(self.arm_by_frame)
+        if not n:
+            return 'Robot arm: click the arm to say which instrument it is, then Measure clip.'
+        s = self._arm_summary or {}
+        if not s.get('n_exported'):
+            tally = f'   [{n} frames measured -- press Measure clip to reconcile them]'
+        else:
+            tally = (f'   [clip: {s["mm_per_px"]:.4f} mm/px, '
+                     f'{s["n_exported"]}/{s["n_measured"]} exported, '
+                     f'+-{s["scatter_pct"]:.1f}%]')
+        if ann is None:
+            return f'Robot arm: nothing found on this frame{tally}'
+        if not ann.measured:
+            return f'Robot arm: the four points are too close together here{tally}'
+        by = 'you' if ann.trusted_by == 'user' else 'auto'
+        state = f'ON ({by})' if ann.trusted else f'OFF ({by})'
+        # the raw reading is shown only when the clip has moved it, and then as a delta:
+        # that difference IS the per-frame noise, and it is the one number that tells you
+        # whether the segmentation on this frame is worth looking at
+        drift = ''
+        if ann.clip_diameter and abs(ann.clip_diameter - ann.diameter) > 0.05:
+            drift = (f'  (raw {ann.diameter:.1f}, '
+                     f'{ann.clip_diameter - ann.diameter:+.1f} from neighbours)')
+        placed = {'manual': '  HAND-PLACED', 'tracked': '  tracked',
+                  'hold': '  HELD (tracking lost its grip)'}.get(ann.source, '')
+        return (f'Robot arm: {ann.export_diameter:.1f} px = {robot_arm.ARM_MM:g} mm  '
+                f'({ann.export_mm_per_px:.4f} mm/px){drift}{placed}  '
+                f'{state}{tally}')
+
+    def _arm_reconcile(self, announce=False):
+        """Re-run the clip reconciliation over every measured frame.
+
+        Cheap (it touches no masks -- only the numbers already measured), so it is run
+        whenever the set of measurements changes rather than being a step to remember."""
+        self._arm_summary = robot_arm.clip_scale(self.arm_by_frame, calib=self.arm_calib)
+        if not announce:
+            return self._arm_summary
+        s = self._arm_summary
+        if not s['n_measured']:
+            self.gui.text('Robot arm: nothing measured yet. Click the arm, then Measure clip.')
+            return s
+        msg = (f'Robot arm: {s["n_exported"]}/{s["n_measured"]} frames exported at '
+               f'{s["mm_per_px"]:.4f} mm/px (+-{s["scatter_pct"]:.1f}%). '
+               f'Per-frame readings scattered {s["raw_scatter_pct"]:.1f}% before '
+               f'reconciling; {s["n_rejected"]} frame(s) disagreed with their neighbours '
+               'and were dropped.')
+        ref = robot_arm.ruler_check(self.arm_by_frame, self.scale_by_frame)
+        if ref:
+            msg += (f' Ruler cross-check on {ref["n"]} frame(s): the ruler reads '
+                    f'{ref["ref_mm_per_px"]:.4f} mm/px against the arm\'s '
+                    f'{ref["arm_mm_per_px"]:.4f} -- x{ref["ratio"]:.3f}. Apply that in '
+                    'Calib ONLY if the two are at a similar depth.')
+        self.gui.text(msg)
+        return s
+
+    def on_arm_measure_clip(self):
+        """Guess the four points off every frame's own mask, then reconcile the diameters.
+        The alternative to TRACK, which carries one frame's points instead."""
+        if self.propagating:
+            self.gui.text('Measure clip: wait for the run to finish or pause it first.')
+            return
+        if self.arm_seed is None:
+            self.gui.text('Measure clip: click the arm first, so the tool knows which '
+                          'instrument it is.')
+            return
+        self.gui.text(f'Robot arm: measuring {self.num_frames} frames...')
+        self.gui.progressbar_update(0)
+        for ti in range(self.num_frames):
+            ann = self.arm_by_frame.get(ti)
+            if ann is None or not ann.manual:
+                self._arm_measure(ti)       # a frame you placed by hand is never redone
+            self._arm_tried.add(ti)
+            if ti % 25 == 0:
+                self.gui.progressbar_update(ti / max(1, self.num_frames))
+                self.gui.app.processEvents()
+        self._arm_reconcile(announce=True)
+        self._save_scales()
+        self._draw_scale_overlay()
+
+    def on_arm_calib(self, value):
+        """The one knob for a systematically fat or thin segmentation."""
+        if self._syncing_scale or self.propagating:
+            return
+        self.arm_calib = float(value)
+        self._arm_reconcile()
+        self._save_scales()
+        self._draw_scale_overlay()
 
     def _draw_scale_overlay(self):
         self.compose_current_im()       # segments (and handles while editing) in compose
@@ -1125,6 +1292,180 @@ class MainController():
                            editing=editing, pending=self.scale_pending,
                            pending_color=scale_objects.CLASSES[self.scale_class]['color'],
                            edit_points=self.scale_edit_points)
+        if self.scale_mode and not self.propagating:
+            self._arm_autofill(self.curr_ti)
+        robot_arm.draw(self.vis_image, self.arm_by_frame.get(self.curr_ti),
+                       comp=self._arm_component(self.curr_ti),
+                       editing=editing and self.scale_class == scale_objects.ARM_CLASS)
+
+    # --- robot arm (scale reference 3; gui/robot_arm.py) -----------------------------
+    # Four points: where the arm enters the picture (one per side) and where its straight
+    # shaft ends (one per side). Guessed off the mask, dragged where the guess was wrong,
+    # carried through the video by TRACK. The diameter is the tip pair measured square to
+    # the centerline between the two midpoints. Whether a frame's diameter is trustworthy
+    # is yours to say -- the auto verdict only sets the initial state.
+
+    def _arm_component(self, ti):
+        """This frame's arm blob (HxW bool), or None. Cached: the overlay is recomposed on
+        every redraw and connected components on a full frame is not free."""
+        if self._arm_comp is not None and self._arm_comp[0] == ti:
+            return self._arm_comp[1]
+        ann = self.arm_by_frame.get(ti)
+        if ann is None:
+            return None
+        comp = robot_arm.pick_component(robot_arm.arm_pixels(self.res_man.get_mask(ti)),
+                                        self._arm_seeds(ti))
+        self._arm_comp = (ti, comp)
+        return comp
+
+    def _arm_seeds(self, ti):
+        """Points that identify WHICH instrument is the arm, best first: this frame's own
+        centerline, the neighbouring frames' (so the choice carries along the video), and
+        the click that first pointed the tool at it."""
+        seeds = []
+        for t in (ti, ti - 1, ti + 1):
+            ann = self.arm_by_frame.get(t)
+            if ann is not None:
+                seeds += [ann.start, ann.end]
+        seeds.append(self.arm_seed)
+        return seeds
+
+    def _arm_autofill(self, ti):
+        """Guess the arm on a frame you have simply scrubbed to, once: the mask is there
+        on every frame, so a frame you look at is a frame that can be measured -- but only
+        after the arm has been pointed at once, and never a second time for the same frame
+        (a frame with no arm on it must not be retried on every redraw). A frame TRACK has
+        already carried the four points onto is left alone."""
+        if self.arm_seed is None or ti in self.arm_by_frame or ti in self._arm_tried:
+            return
+        self._arm_tried.add(ti)
+        if self._arm_measure(ti) is not None:
+            self._arm_reconcile()   # a new measurement changes what the clip agrees on
+            self._save_scales()
+
+    def _arm_measure(self, ti, seeds=None):
+        """Guess the arm's four points on frame ti off its mask and keep the result. seeds
+        overrides which instrument to look for -- a click says so outright, and must not
+        lose to whatever this frame happened to be pointing at before. Returns the
+        ArmMeasure or None (no instrument mask on this frame, or no shaft in it)."""
+        ann = robot_arm.measure_frame(self.res_man.get_mask(ti),
+                                      self._arm_seeds(ti) if seeds is None else seeds)
+        self._arm_comp = None
+        if ann is None:
+            self.arm_by_frame.pop(ti, None)
+        else:
+            # a fresh measurement is a new object, so a verdict you gave this frame has
+            # to be carried onto it -- otherwise TRACK would silently re-trust it
+            ann.adopt_verdict(self.arm_by_frame.get(ti))
+            self.arm_by_frame[ti] = ann
+        return ann
+
+    def _arm_click(self, action, x, y):
+        """Left-click grabs whichever of the four points is under the cursor, otherwise it
+        points the tool at an instrument (re-guessing this frame from there). Right-click
+        turns this frame's diameter off, the fast way to reject a frame while scrubbing."""
+        ann = self.arm_by_frame.get(self.curr_ti)
+        grab = max(4.0, robot_arm.GRAB_PX / self.gui.zoom)
+        if action == 'right':
+            self.on_arm_trust(False)
+            return
+        if action != 'left':
+            return
+        handle = None if ann is None else ann.hit(x, y, grab)
+        if handle is not None:
+            self.arm_drag = handle          # dragged in motion, saved on release
+            return
+        self.arm_seed = (float(x), float(y))
+        self._arm_tried = {self.curr_ti}   # a new seed may pick a different instrument
+        ann = self._arm_measure(self.curr_ti, seeds=[self.arm_seed])
+        if ann is None:
+            # the steps fail for different reasons; say which one, or the fix gets
+            # looked for in the wrong place
+            self.gui.text('Robot arm: ' + robot_arm.diagnose(
+                self.res_man.get_mask(self.curr_ti), [self.arm_seed]))
+        else:
+            self.gui.text(f'Robot arm on frame {self.curr_ti}: {self._arm_readout(ann)}. '
+                          'Drag any of the four squares that landed wrong -- the two on '
+                          'the border, and the two at the end of the shaft; D turns this '
+                          'frame\'s diameter on/off.')
+        self._draw_scale_overlay()
+
+    def on_arm_trust(self, on: Optional[bool] = None):
+        """Turn this frame's diameter on/off (the "Diameter trusted" box, D, right-click).
+        Once you have said either way, no automatic verdict touches this frame again."""
+        # D is a global shortcut, so the mode has to be checked here: it must do nothing
+        # while you are painting masks, even though the arm is still the picked reference
+        if self.propagating or not self.scale_mode \
+                or self.scale_class != scale_objects.ARM_CLASS:
+            return
+        if self._syncing_scale:
+            return                      # the checkbox echoing a redraw, not a user click
+        ann = self.arm_by_frame.get(self.curr_ti)
+        if ann is None:
+            self.gui.text('Robot arm: nothing measured on this frame to turn on or off.')
+            self._draw_scale_overlay()
+            return
+        state = ann.toggle(on)
+        self._save_scales()
+        self._draw_scale_overlay()
+        if state:
+            self.gui.text(f'Frame {self.curr_ti}: diameter ON -- {ann.diameter:.1f} px '
+                          f'= {robot_arm.ARM_MM:g} mm ({ann.mm_per_px:.4f} mm/px), '
+                          'exported as a scale reference.')
+        else:
+            self.gui.text(f'Frame {self.curr_ti}: diameter OFF -- the four points are '
+                          'kept, nothing exported from this frame.'
+                          + ('' if ann.measured else
+                             ' (There is no diameter here anyway: the four points are on '
+                             'top of each other.)'))
+
+    def _arm_seed_track(self, ti, image):
+        """Start following the arm's four points from frame ti. False if there is no arm
+        annotated there to follow."""
+        ann = self.arm_by_frame.get(ti)
+        if ann is None:
+            self._arm_state = None
+            return False
+        from gui import segmenter
+        tracker = segmenter.PointTracker()
+        tracker.init(image, ann.points())
+        self._arm_state = {'tracker': tracker, 'ann': ann}
+        return True
+
+    def _arm_pass(self, ti, image):
+        """One frame of the arm during a TRACK run: carry the four points onto it.
+
+        A frame you placed by hand is a keyframe -- it is never overwritten, and the
+        tracker re-seeds there, so a correction propagates from where you made it. A point
+        the tracker lost is moved by however far the others went (the arm is rigid, so
+        that is the best available guess), and the entry pair is put back onto the image
+        border it belongs on.
+
+        No occluder mask goes in: those masks ARE the arm, and the other references use
+        them to avoid riding it. These four points are meant to ride it."""
+        self._arm_tried.add(ti)         # a frame the run covered is not re-attempted
+        state = self._arm_state
+        if state is None:
+            return
+        keyframe = self.arm_by_frame.get(ti)
+        if keyframe is not None and keyframe.manual:
+            self._arm_seed_track(ti, image)
+            return
+        res = state['tracker'].step(image)
+        good = [r for r in res if r['state'] != 'lost']
+        if not good:
+            return                      # nothing to go on: leave the frame as it was
+        drift = np.mean([np.asarray(r['pos']) - np.asarray(p)
+                         for r, p in zip(res, state['ann'].points())
+                         if r['state'] != 'lost'], axis=0)
+        pts = [r['pos'] if r['state'] != 'lost' else (np.asarray(p) + drift)
+               for r, p in zip(res, state['ann'].points())]
+        pts = [robot_arm.snap_border(p, self.w, self.h) for p in pts[:2]] + list(pts[2:])
+        ann = state['ann'].moved_to(pts, 'tracked' if len(good) == 4 else 'hold')
+        ann.adopt_verdict(self.arm_by_frame.get(ti))
+        self.arm_by_frame[ti] = ann
+        state['ann'] = ann
+        self._arm_comp = None   # the run reconciles the clip once, when it finishes
 
     # --- reference tracking (the scale page's TRACK buttons) -------------------------
     # Its own pass, like the arch's: only probe points are followed, so it is fast and it
@@ -1204,9 +1545,12 @@ class MainController():
             else:
                 self._set_scale_track_lit(None)   # some other run owns the loop
             return
-        if not self._scale_lines(self.curr_ti):
+        # the arm rides along with its own tracker: four points, seeded below
+        arm_on = self.curr_ti in self.arm_by_frame
+        if not self._scale_lines(self.curr_ti) and not arm_on:
             self._set_scale_track_lit(None)
-            self.gui.text('TRACK: draw a reference on this frame first.')
+            self.gui.text('TRACK: draw a reference on this frame first (or click the '
+                          'robot arm to measure it).')
             return
         start = self.curr_ti
         last = 0 if direction == 'backward' else self.T - 1
@@ -1215,15 +1559,23 @@ class MainController():
             edge = 'first' if direction == 'backward' else 'last'
             self.gui.text(f'TRACK: already at the {edge} frame.')
             return
-        if not self._scale_seed(start, self.curr_image_np, self._occluder_mask(start)):
+        if not self._scale_seed(start, self.curr_image_np, self._occluder_mask(start)) \
+                and not arm_on:
             self._set_scale_track_lit(None)
             self.gui.text('TRACK: too little of the reference(s) is visible on this frame '
                           'to track (off-frame, or covered by instruments).')
             return
-        names = ', '.join(scale_objects.class_name(s['cls']) for s in self._scale_states)
+        if arm_on:
+            self._arm_seed_track(start, self.curr_image_np)
+        names = ', '.join([scale_objects.class_name(s['cls']) for s in self._scale_states]
+                          + (['Robot arm (four points)'] if arm_on else []))
         self.gui.text(f'TRACK {direction} from frame {start}: {names}. Click TRACK again '
                       'to pause; gray = lost grip, amber = the points disagreed. '
-                      'Masks are not touched.')
+                      'Masks are not touched.'
+                      + (' The arm\'s four points are carried from THIS frame, so correct '
+                         'them here first -- and each frame keeps its own trust verdict, '
+                         'so scrub back through and turn off the ones you do not believe.'
+                         if arm_on else ''))
 
         step = -1 if direction == 'backward' else 1
         self.propagating = True            # blocks clicks/slider, like mask propagation
@@ -1241,6 +1593,9 @@ class MainController():
                     break
                 image = self.res_man.get_image(t)
                 ok = self._scale_step(t, image, self._occluder_mask(t))
+                if arm_on:
+                    self._arm_pass(t, image)
+                    ok = True           # the arm holds rather than stopping the run
                 self.curr_ti = t                    # show progress live
                 n += 1
                 if n % redraw_every == 0 or not ok:
@@ -1253,11 +1608,14 @@ class MainController():
                                'Correct one there and TRACK again.')
                     break
         finally:
+            if arm_on:
+                self._arm_reconcile()      # the new frames change what the clip agrees on
             self.propagating = False
             self.scale_tracking = False
             self._scale_track_dir = None
             self._set_scale_track_lit(None)
             self._scale_states = []
+            self._arm_state = None
             self.gui.tl_slider.setEnabled(True)
             self.gui.progressbar_update(0)
             self._save_scales()
@@ -1275,6 +1633,12 @@ class MainController():
             self._save_arches()
         if self.scale_drag is not None:
             self.scale_drag = None
+            self._save_scales()
+        if self.arm_drag:
+            # a hand-tuned frame changes what the clip agrees on, so the reconciliation is
+            # re-run rather than left stale. It touches no masks, only the numbers.
+            self.arm_drag = None
+            self._arm_reconcile()
             self._save_scales()
 
     def load_current_image_mask(self, no_mask: bool = False):
@@ -2014,6 +2378,18 @@ class MainController():
             self.scale_drag[0].source = 'manual'  # an adjusted frame is a TRACK keyframe
             self.scale_drag[0].conf = 1.0
             self._draw_scale_overlay()
+            return
+
+        # Dragging one of the robot arm's four points. Everything follows from them, so the
+        # centerline, the scale line and the reading all move with the cursor -- you watch
+        # the number settle rather than clicking and hoping.
+        if self.arm_drag:
+            ann = self.arm_by_frame.get(self.curr_ti)
+            if ann is None:
+                self.arm_drag = None
+            else:
+                ann.move(self.arm_drag, x, y)
+                self._draw_scale_overlay()
             return
 
         # Check if polygon is being drawn and at least one point exists

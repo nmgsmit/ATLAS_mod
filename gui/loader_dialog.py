@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QW
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtCore import Qt
 
-from gui.gui_utils import (legacy_workspace_path_for_video, workspace_path_for_video)
+from gui.gui_utils import (legacy_workspace_path_for_video, root_for_video, video_roots,
+                           workspace_path_for_video)
 from gui.scale_objects import CLASSES as SCALE_CLASSES
 
 # containers OpenCV can decode; anything else in raw_videos is ignored by the browser
@@ -33,6 +34,8 @@ _NEW_BRUSH = QBrush(QColor(150, 150, 150))       # grey   -- not imported yet
 
 _ROLE_PATH = Qt.ItemDataRole.UserRole
 _ROLE_KIND = Qt.ItemDataRole.UserRole + 1        # 'video' or 'workspace'
+
+EXPAND_GROUPS = 8        # folders shown open on load; more than this and they start shut
 
 
 def _resolve_existing_path(path_value: str, fallback_names=()) -> str:
@@ -160,9 +163,15 @@ def _describe_status(count: int, present_label: str, missing_label: str) -> str:
 class LoaderDialog(QDialog):
 
     def __init__(self, parent, raw_videos_root: str, workspace_root: str,
-                 current_workspace: str = None):
+                 current_workspace: str = None, extra_video_roots=None):
         super().__init__(parent)
-        self.raw_videos_root = _resolve_existing_path(raw_videos_root, ('raw_videos', 'raw-videos'))
+        # Several roots, not one: the recordings live in ../data, a sibling of the
+        # checkout, as well as in the project's own raw-videos folder. Roots that do not
+        # exist are dropped, so the list is just "wherever videos might be".
+        self.raw_videos_roots = video_roots(raw_videos_root, extra_video_roots)
+        self.raw_videos_root = (self.raw_videos_roots[0] if self.raw_videos_roots else
+                                _resolve_existing_path(raw_videos_root,
+                                                       ('raw_videos', 'raw-videos')))
         self.workspace_root = _resolve_existing_path(workspace_root, ('workspace',))
         self.current_workspace = (path.normpath(current_workspace)
                                   if current_workspace else None)
@@ -243,60 +252,94 @@ class LoaderDialog(QDialog):
         self._apply_filter(self.filter_box.text())
         self._update_hint()
 
+    def _root_for(self, video_path: str) -> str:
+        """The configured root this video came from -- the one its workspace name is
+        derived from, so the dialog and the loader agree on where it lands."""
+        return root_for_video(video_path, self.raw_videos_roots) or self.raw_videos_root
+
     def _populate_videos(self):
         self.video_tree.clear()
-        if not path.isdir(self.raw_videos_root):
-            item = QTreeWidgetItem([f'(folder not found: {self.raw_videos_root})', ''])
+        if not self.raw_videos_roots:
+            item = QTreeWidgetItem([f'(no video folder found: looked for '
+                                    f'{self.raw_videos_root})', ''])
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.video_tree.addTopLevelItem(item)
             return
 
-        # group videos by their sub-folder under raw_videos (e.g. Nick / Vivian)
-        groups = {}
-        for root, _dirs, files in os.walk(self.raw_videos_root):
-            for f in sorted(files):
-                if path.splitext(f)[1].lower() not in VIDEO_EXTS:
-                    continue
-                full = path.join(root, f)
-                rel = path.relpath(root, self.raw_videos_root)
-                group = '.' if rel == os.curdir else rel
-                groups.setdefault(group, []).append((f, full))
+        # one node per real folder, nested like a file browser: roots at the top, each
+        # sub-folder its own expandable node under its parent
+        nodes = {}          # (root_index, relative_dir) -> QTreeWidgetItem
+        n_folders = 0
 
-        for group in sorted(groups):
-            label = 'raw_videos' if group == '.' else group
-            parent = QTreeWidgetItem([label, ''])
-            parent.setFirstColumnSpanned(True)
-            self.video_tree.addTopLevelItem(parent)
-            for name, full in groups[group]:
-                ws = workspace_path_for_video(full, self.workspace_root, self.raw_videos_root)
-                n_frames = _has_frames(ws)
-                legacy_ws = legacy_workspace_path_for_video(full, self.workspace_root)
-                active_ws = ws if n_frames else legacy_ws
-                if not n_frames:
-                    n_frames = _has_frames(legacy_ws)
-                if n_frames:
-                    status, brush = f'in workspace ({n_frames} frames)', _IMPORTED_BRUSH
-                else:
-                    status, brush = 'not imported', _NEW_BRUSH
-                info = _workspace_info_summary(active_ws) if n_frames else 'Mask× Arch× Scale×'
-                child = QTreeWidgetItem([name, status, info])
-                child.setForeground(1, brush)
-                child.setData(0, _ROLE_PATH, full)
-                child.setData(0, _ROLE_KIND, 'video')
-                parent.addChild(child)
-            parent.setExpanded(True)
+        def folder_node(vroot_i, stem, rel):
+            nonlocal n_folders
+            key = (vroot_i, rel)
+            node = nodes.get(key)
+            if node is not None:
+                return node
+            if rel == '':
+                node = QTreeWidgetItem([stem, ''])
+                self.video_tree.addTopLevelItem(node)
+            else:
+                head, tail = path.split(rel)
+                node = QTreeWidgetItem([tail, ''])
+                folder_node(vroot_i, stem, head).addChild(node)
+            node.setFirstColumnSpanned(True)
+            nodes[key] = node
+            n_folders += 1
+            return node
+
+        for vroot_i, vroot in enumerate(self.raw_videos_roots):
+            stem = path.basename(vroot.rstrip(os.sep)) or vroot
+            for root, _dirs, files in os.walk(vroot):
+                vids = [f for f in sorted(files)
+                        if path.splitext(f)[1].lower() in VIDEO_EXTS]
+                if not vids:
+                    continue
+                rel = path.relpath(root, vroot)
+                parent = folder_node(vroot_i, stem, '' if rel == os.curdir else rel)
+                for name in vids:
+                    full = path.join(root, name)
+                    ws = workspace_path_for_video(full, self.workspace_root,
+                                                  self._root_for(full))
+                    n_frames = _has_frames(ws)
+                    legacy_ws = legacy_workspace_path_for_video(full, self.workspace_root,
+                                                                self._root_for(full))
+                    active_ws = ws if n_frames else legacy_ws
+                    if not n_frames:
+                        n_frames = _has_frames(legacy_ws)
+                    if n_frames:
+                        status, brush = f'in workspace ({n_frames} frames)', _IMPORTED_BRUSH
+                    else:
+                        status, brush = 'not imported', _NEW_BRUSH
+                    info = _workspace_info_summary(active_ws) if n_frames else 'Mask× Arch× Scale×'
+                    child = QTreeWidgetItem([name, status, info])
+                    child.setForeground(1, brush)
+                    child.setData(0, _ROLE_PATH, full)
+                    child.setData(0, _ROLE_KIND, 'video')
+                    parent.addChild(child)
+
+        # a couple of folders read better open; twenty of them read better shut, and
+        # the filter box is how you find something in that case
+        for node in nodes.values():
+            node.setExpanded(n_folders <= EXPAND_GROUPS)
+        for i in range(self.video_tree.topLevelItemCount()):
+            self.video_tree.topLevelItem(i).setExpanded(True)
 
     def _populate_workspaces(self):
         self.workspace_list.clear()
         if not path.isdir(self.workspace_root):
             return
-        for name in sorted(os.listdir(self.workspace_root)):
-            ws = path.join(self.workspace_root, name)
-            if not path.isdir(ws):
-                continue
-            n_frames = _has_frames(ws)
+        # workspaces mirror the data folder tree, so they can sit any number of levels
+        # deep; a folder with frames in it is a workspace and is not descended into
+        for root, dirs, _files in os.walk(self.workspace_root):
+            n_frames = _has_frames(root)
             if not n_frames:
+                dirs.sort()
                 continue
+            dirs.clear()
+            ws = root
+            name = path.relpath(ws, self.workspace_root).replace(os.sep, '/')
             label = f'{name}   ({n_frames} frames)'
             if self.current_workspace and path.normpath(ws) == self.current_workspace:
                 label += '   [current]'
@@ -309,15 +352,23 @@ class LoaderDialog(QDialog):
 
     def _apply_filter(self, text: str):
         text = (text or '').strip().lower()
-        for i in range(self.video_tree.topLevelItemCount()):
-            parent = self.video_tree.topLevelItem(i)
+
+        def visit(item):
+            """Hide folders whose whole subtree is filtered out; open the rest."""
+            if item.data(0, _ROLE_KIND) == 'video':
+                match = text in item.text(0).lower()
+                item.setHidden(not match)
+                return match
             any_visible = False
-            for j in range(parent.childCount()):
-                child = parent.child(j)
-                match = text in child.text(0).lower()
-                child.setHidden(not match)
-                any_visible = any_visible or match
-            parent.setHidden(not any_visible)
+            for j in range(item.childCount()):
+                any_visible = visit(item.child(j)) or any_visible
+            item.setHidden(not any_visible)
+            if text and any_visible:
+                item.setExpanded(True)
+            return any_visible
+
+        for i in range(self.video_tree.topLevelItemCount()):
+            visit(self.video_tree.topLevelItem(i))
 
     def _selected(self):
         """Return (path, kind) for the current tab's selection, or (None, None)."""
@@ -346,8 +397,10 @@ class LoaderDialog(QDialog):
         if kind is None:
             self.hint.setText('Select a raw video or an existing workspace, then Open.')
         elif kind == 'video':
-            ws = workspace_path_for_video(sel_path, self.workspace_root, self.raw_videos_root)
-            legacy_ws = legacy_workspace_path_for_video(sel_path, self.workspace_root)
+            ws = workspace_path_for_video(sel_path, self.workspace_root,
+                                          self._root_for(sel_path))
+            legacy_ws = legacy_workspace_path_for_video(sel_path, self.workspace_root,
+                                                        self._root_for(sel_path))
             if _has_frames(ws) or _has_frames(legacy_ws):
                 self.hint.setText('This video already has a workspace. Opening it continues '
                                   'that annotation (existing frames, masks and arches are kept).')
@@ -364,8 +417,10 @@ class LoaderDialog(QDialog):
         if kind is None:
             return
         if kind == 'video':
-            ws = workspace_path_for_video(sel_path, self.workspace_root, self.raw_videos_root)
-            legacy_ws = legacy_workspace_path_for_video(sel_path, self.workspace_root)
+            ws = workspace_path_for_video(sel_path, self.workspace_root,
+                                          self._root_for(sel_path))
+            legacy_ws = legacy_workspace_path_for_video(sel_path, self.workspace_root,
+                                                        self._root_for(sel_path))
             if _has_frames(ws):
                 self.selection = {'workspace': ws}
                 self.accept()

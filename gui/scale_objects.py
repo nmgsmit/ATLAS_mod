@@ -5,7 +5,10 @@ can compare a predicted metric length against the truth:
 
     1 Ruler        -- a span picked off the surgical ruler, 10 mm (1 cm) by default
     2 Catheter tip -- always 16/3 mm
-    3 Robot arm    -- always 8 mm
+    3 Robot arm    -- always 8 mm, and NOT drawn by hand: it is the arm's diameter,
+                     read square to the centerline between four points (where the arm
+                     enters the picture, and where its straight shaft ends). That tool
+                     lives in gui/robot_arm.py; this module only stores what it produces.
 
 Geometry (deliberately simpler than the Retzius arch in gui/retzius_arch.py): each
 object is a STRAIGHT segment -- two endpoints, no tip and no sharpness. Along it sit
@@ -24,8 +27,9 @@ re-weighting, so a probe that jumps somewhere the others contradict is dropped i
 of dragging the segment. The robust machinery is imported from retzius_arch rather than
 copied -- only the shape being fitted differs.
 
-NOTE: the robot arm is tracked with the same generic probe tracking for now; its own
-dedicated method plugs in at MainController._scale_step_one.
+The robot arm does NOT take part in any of that: it has no probes, and its four points
+are tracked by gui/robot_arm.py's own pass instead. It reaches this module only at save
+time, as the chord its diameter spans.
 
 The GUI wiring (clicks, dragging, class picking, the TRACK loop) lives in
 main_controller.py; objects persist to <workspace>/scale_objects.json.
@@ -38,6 +42,7 @@ from os import path
 import cv2
 import numpy as np
 
+from gui import robot_arm
 # The robust-fitting machinery is shared with the arch: same probes, same trust model,
 # only the fitted shape differs (a segment instead of a parabola).
 from gui.retzius_arch import (BLOCK_MARGIN, HANDLE_R, GRAB_PX, HOLD_COLOR, IRLS_ITERS,
@@ -55,8 +60,10 @@ from gui.retzius_arch import (BLOCK_MARGIN, HANDLE_R, GRAB_PX, HOLD_COLOR, IRLS_
 CLASSES = {
     1: {'name': 'Ruler',        'mm': 10.0,      'fixed_mm': False, 'color': (0, 200, 255)},
     2: {'name': 'Catheter tip', 'mm': 16.0 / 3,  'fixed_mm': True,  'color': (0, 255, 0)},
-    3: {'name': 'Robot arm',    'mm': 8.0,       'fixed_mm': True,  'color': (255, 128, 0)},
+    3: {'name': 'Robot arm',    'mm': robot_arm.ARM_MM,
+                                                 'fixed_mm': True,  'color': robot_arm.ARM_COLOR},
 }
+ARM_CLASS = 3                  # the one class this module does not draw or track itself
 
 N_TRACK = 5                    # probe points per object (ends included)
 DEFAULT_TS = tuple(np.linspace(0.0, 1.0, N_TRACK))
@@ -65,6 +72,20 @@ T_MARGIN = 0.05                # interior probes stay this far from either end, 
 PROBE_R = 3                    # px; probe dot radius
 PROBE_MARGIN = 8               # px; probes stay this far inside the image border
 SCALE_FILE = 'scale_objects.json'   # saved inside the workspace
+
+# Camera focal length in PIXELS, in the coordinate frame the annotations live in (the
+# cropped frame -- source_crop.json is a pure crop, so f is the source video's f; only
+# the principal point shifts). THIS IS THE CALIBRATION KNOB: mm_per_px alone is scale up
+# to an unknown constant, and only f turns it into millimetres:
+#     Z_mm = f_px * mm_per_px          (segment roughly perpendicular to the optical axis)
+# Measure it once per scope (checkerboard, or the endoscope's spec sheet) and set it here.
+# None means "not calibrated": anchors() then reports depth_mm=None instead of guessing.
+FOCAL_PX = None
+# Classes anchors() refuses to hand a loss function. 2 (catheter tip) is excluded because
+# the annotated span disagrees with the ruler by a STABLE 5.1-5.8x across every frame the
+# two share -- not tracker noise, the drawn span simply is not 16/3 mm. Drop the entry
+# once the class has been re-annotated against a span that is.
+EXCLUDE_CLASSES = {2}
 # --------------------------------------------------------------------------
 
 
@@ -86,7 +107,8 @@ class ScaleLine:
         self.mm = default_mm(self.cls_id) if mm is None else float(mm)
         ts = DEFAULT_TS if ts is None else ts
         self.ts = [float(np.clip(t, 0.0, 1.0)) for t in ts]
-        self.source = source     # 'manual' (user keyframe) | 'tracked' | 'hold' (lost)
+        self.source = source     # 'manual' (user keyframe) | 'tracked' | 'hold' (lost) |
+                                 # 'measured' (the arm's own chord)
         self.conf = float(conf)  # [0,1] mean probe trust behind this fit (1 if manual)
 
     def copy(self, **kw):
@@ -289,34 +311,70 @@ def draw(img, lines, editing=False, pending=(), pending_color=(255, 255, 255),
         cv2.circle(img, _pt(p), HANDLE_R - 1, pending_color, -1, cv2.LINE_AA)
 
 
-def save(workspace, by_frame, class_mm=None):
-    """Persist {frame_index: {class_id: ScaleLine}} to <workspace>/scale_objects.json.
+def save(workspace, by_frame, class_mm=None, width=None, height=None,
+         arm_by_frame=None, arm_seed=None, arm_calib=1.0):
+    """Persist the annotations to <workspace>/scale_objects.json.
 
-    The layout is meant to be consumed directly by a depth-estimation loss:
-    frames -> list of objects, each carrying its real length in mm, its endpoints, its
-    probe points, and the mm/px the pair implies on that frame. class_mm overrides the
-    per-class default recorded in the header (the ruler span can be edited)."""
+    by_frame is {frame_index: {class_id: ScaleLine}} for the hand-drawn references;
+    arm_by_frame is {frame_index: robot_arm.ArmMeasure} for the measured robot arm.
+
+    'frames' is the layout meant to be consumed directly by a depth-estimation loss:
+    frame -> list of objects, each carrying its real length in mm, its endpoints, its
+    probe points, and the mm/px the pair implies there. The arm joins that list as the
+    chord its diameter spans -- ONLY on the frames you marked trusted, so every record
+    under 'frames' is a measurement someone stands behind.
+
+    'robot_arm' is the tool's own state (the four points and the verdict) for every frame
+    it has looked at, trusted or not, so an untrusted frame keeps the points you placed on
+    it -- and so a saved annotation can be re-read later without the segmentation, since
+    the four points ARE the state. A loss function reads 'frames' and can ignore this
+    section entirely.
+
+    class_mm overrides the per-class default in the header (the ruler span is editable);
+    width/height record the frame size the pixel coordinates belong to."""
+    arm_by_frame = arm_by_frame or {}
     frames = {}
-    for ti in sorted(by_frame):
-        objs = by_frame[ti]
+    for ti in sorted(set(by_frame) | set(arm_by_frame)):
+        objs = {c: l for c, l in by_frame.get(ti, {}).items() if c != ARM_CLASS}
+        ann = arm_by_frame.get(ti)
+        line = None if ann is None else ann.to_scale_line()
+        if line is not None:
+            objs[ARM_CLASS] = line
         if objs:
             frames[str(ti)] = [objs[c].to_dict() for c in sorted(objs)]
     classes = {str(cid): {'name': spec['name'],
                           'mm': float((class_mm or {}).get(cid, spec['mm'])),
                           'fixed_mm': spec['fixed_mm']}
                for cid, spec in CLASSES.items()}
+    # 'calibration' is the one multiplier for the whole clip, for a segmentation that is
+    # systematically fat or thin -- the error no per-frame geometry can see, because a
+    # dilated mask moves both sides of the arm together and the reading stays consistent
+    # and wrong.
+    arm = {'mm': robot_arm.ARM_MM, 'object_id': robot_arm.ARM_OBJECT_ID,
+           'seed': None if arm_seed is None else list(arm_seed),
+           'calibration': float(arm_calib),
+           'smooth_window': robot_arm.SMOOTH_WIN,
+           'frames': {str(ti): arm_by_frame[ti].to_dict() for ti in sorted(arm_by_frame)}}
     with open(path.join(workspace, SCALE_FILE), 'w') as f:
-        json.dump({'version': 1, 'n_track_points': N_TRACK,
-                   'classes': classes, 'frames': frames}, f, indent=2)
+        json.dump({'version': 2, 'n_track_points': N_TRACK, 'focal_px': FOCAL_PX,
+                   'frame_size': None if width is None or height is None
+                   else [int(width), int(height)],
+                   'classes': classes, 'frames': frames, 'robot_arm': arm}, f, indent=2)
 
 
 def load(workspace):
-    """({frame_index: {class_id: ScaleLine}}, {class_id: mm}) from the workspace.
-    Missing or unreadable file -> empty annotations and the built-in class defaults."""
+    """(by_frame, class_mm, arm_by_frame, arm_seed, arm_calib) from the workspace. Missing
+    or unreadable file -> empty annotations and the built-in class defaults.
+
+    Class 3 is never returned in by_frame: the arm is owned by arm_by_frame, and the
+    class-3 records under 'frames' are its export, regenerated on every save. An arm
+    record from before the four-point tool loads as nothing (robot_arm.ArmMeasure.
+    from_dict) -- press Measure clip to redo them; the rest of the references are
+    unaffected."""
     defaults = {cid: float(spec['mm']) for cid, spec in CLASSES.items()}
     file = path.join(workspace, SCALE_FILE)
     if not path.exists(file):
-        return {}, defaults
+        return {}, defaults, {}, None, 1.0
     try:
         with open(file) as f:
             data = json.load(f)
@@ -325,17 +383,67 @@ def load(workspace):
             frame = {}
             for d in objs:
                 line = ScaleLine.from_dict(d)
-                if line.cls_id in CLASSES:
+                if line.cls_id in CLASSES and line.cls_id != ARM_CLASS:
                     frame[line.cls_id] = line
             if frame:
                 by_frame[int(ti)] = frame
         for cid, spec in data.get('classes', {}).items():
             if int(cid) in defaults and 'mm' in spec:
                 defaults[int(cid)] = float(spec['mm'])
-        return by_frame, defaults
+        arm = data.get('robot_arm') or {}
+        arm_by_frame = {}
+        for ti, d in (arm.get('frames') or {}).items():
+            ann = robot_arm.ArmMeasure.from_dict(d)
+            if ann is not None:
+                arm_by_frame[int(ti)] = ann
+        seed = arm.get('seed')
+        return (by_frame, defaults, arm_by_frame,
+                None if seed is None else tuple(seed),
+                float(arm.get('calibration', 1.0) or 1.0))
     except (ValueError, KeyError, TypeError, IndexError) as e:
         print(f'[scale_objects] could not read {file}: {e}')
-        return {}, defaults
+        return {}, defaults, {}, None, 1.0
+
+
+def anchors(workspace, focal_px=None):
+    """The scale anchors of a workspace, filtered for a depth loss:
+    [{frame, class_id, class_name, mm, points, length_px, mm_per_px, source, conf,
+      depth_mm}], one entry per usable object per frame.
+
+    Reads the 'frames' section ONLY. That matters for the arm: 'robot_arm.frames' is the
+    tool's state for every frame it looked at, rejected ones included (mm_per_px there
+    runs from 0.0 upwards), while 'frames' holds only the reconciled, trusted export.
+
+    Dropped: EXCLUDE_CLASSES, source 'hold' (the tracker lost the object and the previous
+    pose is being held -- a pose, not a measurement), and non-positive mm_per_px.
+
+    depth_mm = focal_px * mm_per_px, or None when no focal length is known (argument
+    first, else FOCAL_PX). It assumes the segment is roughly perpendicular to the optical
+    axis -- a tilted span is foreshortened and reads too near -- and it is the depth AT
+    THAT SEGMENT, not of the frame."""
+    f = FOCAL_PX if focal_px is None else float(focal_px)
+    file = path.join(workspace, SCALE_FILE)
+    if not path.exists(file):
+        return []
+    try:
+        with open(file) as fh:
+            data = json.load(fh)
+    except ValueError as e:
+        print(f'[scale_objects] could not read {file}: {e}')
+        return []
+    out = []
+    for ti, objs in sorted((data.get('frames') or {}).items(), key=lambda kv: int(kv[0])):
+        for d in objs:
+            mmpp = float(d.get('mm_per_px') or 0.0)
+            if d.get('class_id') in EXCLUDE_CLASSES or d.get('source') == 'hold':
+                continue
+            if mmpp <= 0:
+                continue
+            rec = dict(d, frame=int(ti),
+                       depth_mm=None if f is None else f * mmpp)
+            out.append(rec)
+    return out
+
 
 
 if __name__ == '__main__':
@@ -428,14 +536,18 @@ if __name__ == '__main__':
 
     # save/load roundtrip: per-frame per-class, edited ruler mm, derived fields present
     import tempfile
+    empty = ({}, {1: 10.0, 2: 16 / 3, 3: 8.0}, {}, None, 1.0)
     with tempfile.TemporaryDirectory() as d:
-        assert load(d) == ({}, {1: 10.0, 2: 16 / 3, 3: 8.0})       # nothing saved yet
+        assert load(d) == empty                                    # nothing saved yet
         ruler = ScaleLine(1, (5, 5), (105, 5), mm=20.0, source='tracked', conf=0.42)
         cath = ScaleLine(2, (10, 40), (60, 90))
-        save(d, {7: {1: ruler, 2: cath}, 9: {}}, class_mm={1: 20.0})
-        back, mms = load(d)
+        save(d, {7: {1: ruler, 2: cath}, 9: {}}, class_mm={1: 20.0},
+             width=320, height=240)
+        back, mms, arms, seed, calib = load(d)
         assert list(back) == [7] and sorted(back[7]) == [1, 2]     # empty frame dropped
         assert mms[1] == 20.0 and mms[2] == 16 / 3
+        assert arms == {} and seed is None
+        assert calib == 1.0                           # defaults for a fresh file
         b1 = back[7][1]
         assert b1.mm == 20.0 and b1.source == 'tracked' and abs(b1.conf - 0.42) < 1e-4
         assert b1.a == ruler.a and b1.b == ruler.b and b1.ts == ruler.ts
@@ -444,9 +556,32 @@ if __name__ == '__main__':
         rec = raw['frames']['7'][0]
         assert rec['class_name'] == 'Ruler' and len(rec['points']) == N_TRACK
         assert abs(rec['mm_per_px'] - 20.0 / 100) < 1e-6           # ready for the loss fn
+        assert raw['frame_size'] == [320, 240]
+
+        # the robot arm: its own section always, but a class-3 measurement under
+        # 'frames' only where it is trusted -- an untrusted frame still keeps its four
+        # points, it just is not a measurement anyone can use
+        good = robot_arm.ArmMeasure([(0, 90), (0, 110), (80, 90), (80, 110)])
+        off = robot_arm.ArmMeasure([(0, 92), (0, 108), (60, 92), (60, 108)], manual=True)
+        off.toggle(False)
+        save(d, {7: {1: ruler}}, class_mm={1: 20.0}, width=320, height=240,
+             arm_by_frame={7: good, 8: off}, arm_seed=(12, 34), arm_calib=1.05)
+        back, _, arms, seed, calib = load(d)
+        assert seed == (12.0, 34.0) and sorted(arms) == [7, 8]
+        assert abs(calib - 1.05) < 1e-9                             # the clip-level knob
+        assert arms[7].trusted and not arms[8].trusted and arms[8].manual
+        assert abs(arms[8].diameter - 16.0) < 1e-6                 # kept, just not exported
+        assert 3 not in back.get(7, {}), 'the arm is owned by arm_by_frame, not by_frame'
+        with open(path.join(d, SCALE_FILE)) as f:
+            raw = json.load(f)
+        assert [r['class_id'] for r in raw['frames']['7']] == [1, 3]
+        assert abs(raw['frames']['7'][1]['mm_per_px'] - robot_arm.ARM_MM / 20.0) < 1e-9
+        assert '8' not in raw['frames'], 'an untrusted frame exports no measurement'
+        assert raw['robot_arm']['frames']['8']['trusted_by'] == 'user'
+
         with open(path.join(d, SCALE_FILE), 'w') as f:
             f.write('{ not json')
-        assert load(d) == ({}, {1: 10.0, 2: 16 / 3, 3: 8.0})       # corrupt file survives
+        assert load(d) == empty                                    # corrupt file survives
 
     print('[scale_objects] ok | classes=%s | probes=%d'
           % ({c: f"{s['name']} {s['mm']:.3f}mm" for c, s in CLASSES.items()}, N_TRACK))

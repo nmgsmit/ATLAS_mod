@@ -81,7 +81,8 @@ if __name__ in "__main__":
     # no --video/--images/--workspace given: ask via the loader dialog instead of failing
     if cfg['video'] is None and cfg['images'] is None and cfg['workspace'] is None:
         dialog = LoaderDialog(None, raw_videos_root=cfg.get('raw_videos_root', './raw_videos'),
-                              workspace_root=cfg.get('workspace_root', './workspace'))
+                              workspace_root=cfg.get('workspace_root', './workspace'),
+                              extra_video_roots=cfg.get('extra_video_roots'))
         if not dialog.exec() or not dialog.selection:
             sys.exit(0)
         with open_dict(cfg):

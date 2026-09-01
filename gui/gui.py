@@ -178,6 +178,53 @@ class GUI(QWidget):
                                            'stays straight. Off by default.')
         self.scale_points_check.toggled.connect(controller.on_scale_edit_points)
 
+        # Robot arm only: is THIS frame's measured diameter one you believe? Nothing but
+        # the frames left ticked is exported, so this is the annotation, not a display
+        # option. Enabled only while the robot arm is the active reference.
+        self.arm_trust_check = QCheckBox('Export this frame  (D)')
+        self.arm_trust_check.setToolTip('Robot arm: export this frame\'s diameter as a '
+                                        'scale reference. Set automatically by the clip '
+                                        'reconciliation -- frames that disagree with '
+                                        'their neighbours are dropped -- and your answer '
+                                        'overrides that for good. Frames left off keep '
+                                        'their four points, they just are not exported.')
+        self.arm_trust_check.setEnabled(False)
+        self.arm_trust_check.toggled.connect(controller.on_arm_trust)
+
+        # Robot arm only: re-guess every frame off its own mask and reconcile them against
+        # each other, which is the step that makes the millimetres consistent -- a single
+        # frame cannot see its own error, because a mask a pixel fat moves both sides of
+        # the arm together. See robot_arm.clip_scale. (TRACK is the other way in: it
+        # carries the four points from THIS frame instead of re-guessing each one.)
+        self.arm_measure_btn = QPushButton('Measure clip')
+        self.arm_measure_btn.setToolTip(
+            'Robot arm: guess the four points off every frame\'s mask, then reconcile '
+            'the diameters. Each frame is exported as the local median of its neighbours '
+            'rather than its own reading, and frames that disagree are dropped '
+            'automatically. Click the arm once first to say which instrument it is; '
+            'frames whose points you placed by hand are left alone.')
+        self.arm_measure_btn.setEnabled(False)
+        self.arm_measure_btn.clicked.connect(controller.on_arm_measure_clip)
+
+        # The one knob per-frame geometry cannot replace: a mask that is systematically fat
+        # or thin reads wide or narrow on EVERY frame, so no amount of smoothing or edge
+        # fitting recovers it. Cross-check it against the hand-drawn ruler (which carries
+        # none of the mask's bias) and type the correction here.
+        self.arm_calib_box = QDoubleSpinBox()
+        self.arm_calib_box.setRange(0.50, 2.00)
+        self.arm_calib_box.setSingleStep(0.01)
+        self.arm_calib_box.setDecimals(3)
+        self.arm_calib_box.setValue(1.0)
+        self.arm_calib_box.setPrefix('x ')
+        self.arm_calib_box.setToolTip(
+            'Robot arm: one multiplier for the whole clip, for a segmentation that is '
+            'systematically fat or thin. 1.0 leaves the measurement alone. The readout '
+            'says how the arm compares with the ruler on frames that have both -- but '
+            'only trust that comparison where the two are at a similar depth, since '
+            'mm/px genuinely differs between a near object and a far one.')
+        self.arm_calib_box.setEnabled(False)
+        self.arm_calib_box.valueChanged.connect(controller.on_arm_calib)
+
         self.scale_info_label = QLabel('Reference: --')
         self.scale_info_label.setMinimumWidth(260)
 
@@ -446,6 +493,10 @@ class GUI(QWidget):
         mm_row.addWidget(QLabel('Length:'))
         mm_row.addWidget(self.scale_mm_box)
         mm_row.addWidget(self.scale_points_check)
+        mm_row.addWidget(self.arm_measure_btn)
+        mm_row.addWidget(self.arm_trust_check)
+        mm_row.addWidget(QLabel('Calib:'))
+        mm_row.addWidget(self.arm_calib_box)
         scale_shape_layout.addLayout(mm_row)
         scale_shape_layout.addWidget(self.scale_info_label)
         self.scale_shape_box = QGroupBox('Reference size')
@@ -592,6 +643,11 @@ class GUI(QWidget):
         
         # Toggle visualization mode
         QShortcut(QKeySequence(Qt.Key.Key_T), self).activated.connect(controller.on_toggle_vis_mode)
+
+        # Robot arm: trust / distrust this frame's measured diameter. The one key you
+        # press over and over while scrubbing the video, so it gets its own letter;
+        # a no-op unless the robot arm is the active scale reference.
+        QShortcut(QKeySequence(Qt.Key.Key_D), self).activated.connect(controller.on_arm_trust)
 
         # undo last click
         QShortcut(QKeySequence('Ctrl+Z'), self).activated.connect(controller.on_undo)
@@ -898,7 +954,8 @@ class GUI(QWidget):
         dialog = LoaderDialog(self,
                               raw_videos_root=self.cfg.get('raw_videos_root', './raw_videos'),
                               workspace_root=self.cfg.get('workspace_root', './workspace'),
-                              current_workspace=self.cfg.get('workspace'))
+                              current_workspace=self.cfg.get('workspace'),
+                              extra_video_roots=self.cfg.get('extra_video_roots'))
         if dialog.exec() and dialog.selection:
             self.controller.load_workspace(**dialog.selection)
 

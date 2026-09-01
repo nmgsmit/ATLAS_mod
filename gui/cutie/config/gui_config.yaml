@@ -4,6 +4,17 @@ defaults:
 
 # workspace configuration
 workspace_root: ./workspace
+
+# Where "Open..." looks for source videos. raw_videos_root is the project's own folder;
+# extra_video_roots are searched as well, so recordings that live OUTSIDE the checkout
+# show up in the same browser. Relative paths are resolved against the working directory
+# and then the project root, and a folder that does not exist is skipped -- so listing
+# somewhere you do not have costs nothing. A video's workspace is named after its path
+# under whichever of these roots contains it, so clips of the same name in different case
+# folders never collide.
+raw_videos_root: ./raw-videos
+extra_video_roots:
+  - ../data
 image_endpoint: images
 mask_endpoint: masks
 vis_endpoint: vis
@@ -20,6 +31,14 @@ max_internal_size: 480
 # reducing this mainly speed up I/O
 # it should not be smaller than the internal size
 max_overall_size: 1080
+
+# cut the black bars off the picture when extracting a video / copying in images.
+# Endoscope recordings are letterboxed and the padding is not picture: it wastes network
+# resolution, skews max_overall_size (which scales to the SHORT edge, partly padding),
+# and stops an instrument running off the side from touching the image border -- which is
+# the anchor the robot-arm scale reference pins its centerline to. Detected once from
+# sampled frames and recorded in <workspace>/source_crop.json. See gui/border_crop.py.
+crop_borders: True
 buffer_size: 20
 
 # we use multithreading for saving the results

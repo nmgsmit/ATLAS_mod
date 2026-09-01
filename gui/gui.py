@@ -225,6 +225,28 @@ class GUI(QWidget):
         self.arm_calib_box.setEnabled(False)
         self.arm_calib_box.valueChanged.connect(controller.on_arm_calib)
 
+        # GUI-bar boxes (gui/gui_bar.py): junk the extraction script missed, covered by
+        # hand. Armed rather than always-on, so a drag can never draw a box while a
+        # reference is being placed.
+        self.gui_bar_check = QCheckBox('COVER GUI')
+        self.gui_bar_check.setToolTip('Drag a box over on-screen junk (a GUI bar) that '
+                                      'survived the extraction; right-click a box to '
+                                      'remove it. TRACK carries the boxes through the '
+                                      'clip, stopping by itself at the first frame where '
+                                      'the inside of a box changes.')
+        self.gui_bar_check.toggled.connect(controller.on_gui_bar_mode)
+        self.gui_bar_clear_btn = QPushButton('DELETE BOXES')
+        self.gui_bar_clear_btn.setToolTip('Delete the boxes on this frame, or on every '
+                                          'frame. (Right-clicking a single box removes '
+                                          'just that one.) The frames themselves are not '
+                                          'touched -- BLANK FRAMES is what changes them.')
+        self.gui_bar_clear_btn.clicked.connect(controller.on_clear_bars)
+        self.gui_bar_blank_btn = QPushButton('BLANK FRAMES')
+        self.gui_bar_blank_btn.setToolTip('Paint every box black into the workspace '
+                                          'frames. Cannot be undone -- those files are '
+                                          'what the networks and the export read.')
+        self.gui_bar_blank_btn.clicked.connect(controller.on_blank_bars)
+
         self.scale_info_label = QLabel('Reference: --')
         self.scale_info_label.setMinimumWidth(260)
 
@@ -502,6 +524,10 @@ class GUI(QWidget):
         self.scale_shape_box = QGroupBox('Reference size')
         self.scale_shape_box.setLayout(scale_shape_layout)
 
+        self.gui_bar_box = make_group('GUI bar', [self.gui_bar_check,
+                                                  self.gui_bar_clear_btn,
+                                                  self.gui_bar_blank_btn])
+
         self.scale_track_box = make_group('Reference tracking',
                                           [self.reset_scale_button,
                                            self.scale_track_back_button,
@@ -533,7 +559,8 @@ class GUI(QWidget):
         self.mode_stack = QStackedWidget()
         self.mode_stack.addWidget(make_page([self.class_box, self.edit_box], self.segment_box))
         self.mode_stack.addWidget(make_page([self.arch_shape_box], self.arch_track_box))
-        self.mode_stack.addWidget(make_page([self.scale_class_box, self.scale_shape_box],
+        self.mode_stack.addWidget(make_page([self.scale_class_box, self.scale_shape_box,
+                                             self.gui_bar_box],
                                             self.scale_track_box))
 
         navi.addLayout(top_row)
@@ -908,16 +935,39 @@ class GUI(QWidget):
             return 'frame'
         return None
 
-    def ask_reset_scale(self, name: str, n_frames: int, has_current: bool, curr_ti: int):
-        """Ask what RESET REFERENCE should clear for the active reference. Returns
-        'frame', 'all', or None to cancel -- same deal as ask_reset_arch: irreversible,
-        so the scope is an explicit choice and Cancel is the default button."""
+    def ask_blank_bars(self, n_frames: int) -> bool:
+        """Confirm painting the GUI boxes into the frames. Irreversible: it rewrites the
+        workspace images everything downstream reads."""
         box = QMessageBox(self)
-        box.setWindowTitle('Reset reference')
+        box.setWindowTitle('Blank frames')
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f'Paint the GUI boxes black into {n_frames} frame(s)?')
+        box.setInformativeText('The workspace images are overwritten. The originals are '
+                               'copied to images_backup/ first, the one time -- copy that '
+                               'folder back to undo. Masks and annotations are not '
+                               'touched.')
+        ok_btn = box.addButton(f'Blank {n_frames} frame(s)',
+                               QMessageBox.ButtonRole.DestructiveRole)
+        cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(cancel_btn)
+        for b in box.buttons():
+            fit_button_text(b)
+        box.exec()
+        return box.clickedButton() is ok_btn
+
+    def ask_reset_scale(self, name: str, n_frames: int, has_current: bool, curr_ti: int,
+                        title: str = 'Reset reference',
+                        note: str = 'Clearing it cannot be undone. Other references are '
+                                    'not touched.'):
+        """Ask what RESET REFERENCE should clear for the active reference (and, with the
+        title/note replaced, what DELETE BOXES should clear). Returns 'frame', 'all', or
+        None to cancel -- same deal as ask_reset_arch: irreversible, so the scope is an
+        explicit choice and Cancel is the default button."""
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setText(f'"{name}" is drawn on {n_frames} frame(s).')
-        box.setInformativeText('Clearing it cannot be undone. Other references are '
-                               'not touched.')
+        box.setInformativeText(note)
         frame_btn = None
         if has_current:
             frame_btn = box.addButton(f'Clear frame {curr_ti} only',

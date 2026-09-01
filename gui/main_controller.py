@@ -1,4 +1,5 @@
 import os
+import shutil
 from os import path
 import logging
 from typing import Literal, Optional
@@ -15,6 +16,7 @@ except:
 from torch import autocast
 from torchvision.transforms.functional import to_tensor
 import numpy as np
+from PIL import Image
 from omegaconf import DictConfig, open_dict
 
 from gui.cutie.model.cutie import CUTIE
@@ -33,6 +35,7 @@ from gui.cutie.utils.palette import custom_names, custom_palette_np # added
 from gui import retzius_arch
 from gui import robot_arm
 from gui import scale_objects
+from gui import gui_bar
 from gui.gui_utils import video_roots, workspace_name_for_video
 
 log = logging.getLogger()
@@ -143,8 +146,6 @@ class MainController():
         self.arm_drag = None            # 'e0'|'e1'|'t0'|'t1' while that point is dragged
         self._arm_comp = None           # (frame, HxW bool) cache of the arm's mask blob,
                                         # so the overlay does not re-run the components
-        self._arm_tried = set()         # frames already auto-measured, so a frame with no
-                                        # arm on it is not re-attempted on every redraw
         self._arm_state = None          # the arm's tracking state, live during a TRACK run
         # {frame: {class_id: ScaleLine}}, per-class mm, {frame: ArmMeasure}, and the seed
         # click that says WHICH instrument is the arm.
@@ -154,6 +155,14 @@ class MainController():
         # readout shows. Rebuilt from the per-frame measurements, never persisted.
         self._arm_summary = None
         self._arm_reconcile()
+
+        # GUI-bar boxes (gui/gui_bar.py): hand-drawn rectangles over on-screen junk the
+        # extraction missed, tracked along with the references and painted out on demand.
+        self.bar_mode = False           # True while COVER GUI is armed (drag draws a box)
+        self.bar_pending = None         # the box being dragged right now
+        self.bar_anchor = None          # where that drag started (a box grows from it)
+        self.bars_by_frame = gui_bar.load(self.res_man.workspace)
+        self._bar_states = []           # per-box tracking state, live during a TRACK run
 
         self.load_current_image_mask()
         self.show_current_frame()
@@ -1046,8 +1055,10 @@ class MainController():
                 f'"{custom_names[robot_arm.ARM_OBJECT_ID]}" mask, segmented and propagated '
                 'like any other object) to say which instrument it is: the four points are '
                 'guessed off that mask. 2) Drag any of the four squares that landed in the '
-                'wrong place -- the centerline runs between the pairs and the white scale '
-                'line is the diameter, square to it, which is what gets exported. 3) TRACK '
+                'wrong place -- the two on the border only slide ALONG it, the two at the '
+                'shaft end move freely; the centerline runs between the pairs and the '
+                'white scale line is the diameter, square to it, which is what gets '
+                'exported. 3) TRACK '
                 'carries the four points through the video (a frame you correct becomes a '
                 'keyframe), or MEASURE CLIP re-guesses every frame off its mask. Then: D '
                 '(or right-click) drops a frame you do not believe, and CALIB is the one '
@@ -1082,6 +1093,9 @@ class MainController():
     def _scale_click(self, action, x, y):
         # handles are grabbed in image coords; shrink the radius when zoomed in so the
         # on-screen grab distance stays roughly constant
+        if self.bar_mode:
+            self._bar_click(action, x, y)
+            return
         if self.scale_class == scale_objects.ARM_CLASS:
             self._arm_click(action, x, y)
             return
@@ -1143,7 +1157,6 @@ class MainController():
         if arm and scope != 'frame':
             self.arm_seed = None        # a full reset forgets which instrument was the arm
         self._arm_comp = None
-        self._arm_tried = set()
         self.scale_pending = []
         self.scale_drag = None
         self.arm_drag = None
@@ -1202,7 +1215,9 @@ class MainController():
         else:
             tally = (f'   [clip: {s["mm_per_px"]:.4f} mm/px, '
                      f'{s["n_exported"]}/{s["n_measured"]} exported, '
-                     f'+-{s["scatter_pct"]:.1f}%]')
+                     f'+-{s["scatter_pct"]:.1f}%'
+                     + (f', JUMPED at frame {s["break_at"]}' if s.get('n_broken') else '')
+                     + ']')
         if ann is None:
             return f'Robot arm: nothing found on this frame{tally}'
         if not ann.measured:
@@ -1237,8 +1252,14 @@ class MainController():
         msg = (f'Robot arm: {s["n_exported"]}/{s["n_measured"]} frames exported at '
                f'{s["mm_per_px"]:.4f} mm/px (+-{s["scatter_pct"]:.1f}%). '
                f'Per-frame readings scattered {s["raw_scatter_pct"]:.1f}% before '
-               f'reconciling; {s["n_rejected"]} frame(s) disagreed with their neighbours '
-               'and were dropped.')
+               f'reconciling; {s["n_rejected"]} frame(s) were dropped.')
+        if s['n_broken']:
+            # the one rejection worth acting on: the others are noise, this one says the
+            # points came off the arm and names the frame to go and fix
+            msg += (f' {s["n_broken"]} of those JUMPED away from the reading before them '
+                    f'-- first at frame {s["break_at"]} (chain anchored at frame '
+                    f'{s["anchor"]}). Go there, put the four points back on the arm, and '
+                    'TRACK on from it: everything past a jump is dropped until you do.')
         ref = robot_arm.ruler_check(self.arm_by_frame, self.scale_by_frame)
         if ref:
             msg += (f' Ruler cross-check on {ref["n"]} frame(s): the ruler reads '
@@ -1264,10 +1285,9 @@ class MainController():
             ann = self.arm_by_frame.get(ti)
             if ann is None or not ann.manual:
                 self._arm_measure(ti)       # a frame you placed by hand is never redone
-            self._arm_tried.add(ti)
             if ti % 25 == 0:
                 self.gui.progressbar_update(ti / max(1, self.num_frames))
-                self.gui.app.processEvents()
+                self.gui.process_events()
         self._arm_reconcile(announce=True)
         self._save_scales()
         self._draw_scale_overlay()
@@ -1292,8 +1312,8 @@ class MainController():
                            editing=editing, pending=self.scale_pending,
                            pending_color=scale_objects.CLASSES[self.scale_class]['color'],
                            edit_points=self.scale_edit_points)
-        if self.scale_mode and not self.propagating:
-            self._arm_autofill(self.curr_ti)
+        gui_bar.draw(self.vis_image, self.bars_by_frame.get(self.curr_ti, []),
+                     pending=self.bar_pending)
         robot_arm.draw(self.vis_image, self.arm_by_frame.get(self.curr_ti),
                        comp=self._arm_component(self.curr_ti),
                        editing=editing and self.scale_class == scale_objects.ARM_CLASS)
@@ -1330,19 +1350,6 @@ class MainController():
         seeds.append(self.arm_seed)
         return seeds
 
-    def _arm_autofill(self, ti):
-        """Guess the arm on a frame you have simply scrubbed to, once: the mask is there
-        on every frame, so a frame you look at is a frame that can be measured -- but only
-        after the arm has been pointed at once, and never a second time for the same frame
-        (a frame with no arm on it must not be retried on every redraw). A frame TRACK has
-        already carried the four points onto is left alone."""
-        if self.arm_seed is None or ti in self.arm_by_frame or ti in self._arm_tried:
-            return
-        self._arm_tried.add(ti)
-        if self._arm_measure(ti) is not None:
-            self._arm_reconcile()   # a new measurement changes what the clip agrees on
-            self._save_scales()
-
     def _arm_measure(self, ti, seeds=None):
         """Guess the arm's four points on frame ti off its mask and keep the result. seeds
         overrides which instrument to look for -- a click says so outright, and must not
@@ -1376,7 +1383,6 @@ class MainController():
             self.arm_drag = handle          # dragged in motion, saved on release
             return
         self.arm_seed = (float(x), float(y))
-        self._arm_tried = {self.curr_ti}   # a new seed may pick a different instrument
         ann = self._arm_measure(self.curr_ti, seeds=[self.arm_seed])
         if ann is None:
             # the steps fail for different reasons; say which one, or the fix gets
@@ -1386,8 +1392,8 @@ class MainController():
         else:
             self.gui.text(f'Robot arm on frame {self.curr_ti}: {self._arm_readout(ann)}. '
                           'Drag any of the four squares that landed wrong -- the two on '
-                          'the border, and the two at the end of the shaft; D turns this '
-                          'frame\'s diameter on/off.')
+                          'the border slide along it, the two at the end of the shaft go '
+                          'anywhere; D turns this frame\'s diameter on/off.')
         self._draw_scale_overlay()
 
     def on_arm_trust(self, on: Optional[bool] = None):
@@ -1433,7 +1439,8 @@ class MainController():
         return True
 
     def _arm_pass(self, ti, image):
-        """One frame of the arm during a TRACK run: carry the four points onto it.
+        """One frame of the arm during a TRACK run: carry the four points onto it. Returns
+        None normally, or the sentence to stop the run with.
 
         A frame you placed by hand is a keyframe -- it is never overwritten, and the
         tracker re-seeds there, so a correction propagates from where you made it. A point
@@ -1441,31 +1448,179 @@ class MainController():
         that is the best available guess), and the entry pair is put back onto the image
         border it belongs on.
 
+        The run STOPS if the entry pair has moved further in one frame than the arm
+        possibly could (robot_arm.ENTRY_DRIFT_PX). That is the tracker having let go, and
+        the frame is not written: everything measured from there on would be measured from
+        the wrong place, and it is worth an annotator's minute now instead of a hundred
+        frames to be found later.
+
         No occluder mask goes in: those masks ARE the arm, and the other references use
         them to avoid riding it. These four points are meant to ride it."""
-        self._arm_tried.add(ti)         # a frame the run covered is not re-attempted
         state = self._arm_state
         if state is None:
-            return
+            return None
         keyframe = self.arm_by_frame.get(ti)
         if keyframe is not None and keyframe.manual:
             self._arm_seed_track(ti, image)
-            return
+            return None
         res = state['tracker'].step(image)
         good = [r for r in res if r['state'] != 'lost']
         if not good:
-            return                      # nothing to go on: leave the frame as it was
+            return None                 # nothing to go on: leave the frame as it was
         drift = np.mean([np.asarray(r['pos']) - np.asarray(p)
                          for r, p in zip(res, state['ann'].points())
                          if r['state'] != 'lost'], axis=0)
         pts = [r['pos'] if r['state'] != 'lost' else (np.asarray(p) + drift)
                for r, p in zip(res, state['ann'].points())]
-        pts = [robot_arm.snap_border(p, self.w, self.h) for p in pts[:2]] + list(pts[2:])
-        ann = state['ann'].moved_to(pts, 'tracked' if len(good) == 4 else 'hold')
+        ann = state['ann'].moved_to(pts, 'tracked' if len(good) == 4 else 'hold',
+                                    shape=(self.h, self.w))
+        moved = robot_arm.entry_drift(state['ann'], ann)
+        if moved > robot_arm.ENTRY_DRIFT_PX:
+            return (f'the robot arm let go at frame {ti} -- its entry point jumped '
+                    f'{moved:.0f} px in one frame, and where the arm crosses the border '
+                    f'cannot move more than about {robot_arm.ENTRY_DRIFT_PX:g}. Frame '
+                    f'{ti} was not written. Put the four points back on the arm there and '
+                    'TRACK again from it.')
         ann.adopt_verdict(self.arm_by_frame.get(ti))
         self.arm_by_frame[ti] = ann
         state['ann'] = ann
         self._arm_comp = None   # the run reconciles the clip once, when it finishes
+        return None
+
+    # --- GUI-bar boxes (gui/gui_bar.py) ----------------------------------------------
+    # A rectangle dragged over on-screen junk the extraction script missed. Tracked by the
+    # same TRACK buttons as the references -- but by the box's INSIDE, which is flat and
+    # constant, not its edges -- and finally painted black into the frames themselves.
+
+    def on_gui_bar_mode(self, on: bool):
+        """Arm/disarm drawing GUI boxes. While armed the drag owns the clicks, so a box
+        can never be drawn by accident while a reference is being placed."""
+        self.bar_mode = bool(on)
+        self.bar_pending = None
+        self._draw_scale_overlay()
+        self.gui.text('COVER GUI: drag a box over the junk (right-click a box to remove '
+                      'it). TRACK carries the boxes through the clip; BLANK FRAMES then '
+                      'paints them black into the frames.' if on else
+                      'COVER GUI off -- the boxes stay, the clicks go back to the '
+                      'references.')
+
+    def _bar_click(self, action, x, y):
+        bars = self.bars_by_frame.get(self.curr_ti, [])
+        if action == 'left':
+            self.bar_anchor = (x, y)
+            self.bar_pending = gui_bar.Bar(x, y, x, y)   # grown in motion, kept on release
+            return
+        if action == 'right':
+            # topmost box under the cursor: the last drawn is the one you just misplaced
+            hit = next((b for b in reversed(bars) if b.contains(x, y)), None)
+            if hit is None:
+                self.gui.text('No GUI box under the cursor on this frame.')
+            else:
+                bars.remove(hit)
+                if not bars:
+                    self.bars_by_frame.pop(self.curr_ti, None)
+                gui_bar.save(self.res_man.workspace, self.bars_by_frame)
+                self.gui.text(f'GUI box removed from frame {self.curr_ti}.')
+            self._draw_scale_overlay()
+
+    def on_clear_bars(self):
+        """Delete the boxes on this frame or on all of them -- the way out of a box drawn
+        wrong, or a TRACK run that carried one off the bar. Frames already blanked stay
+        blanked: the pixels are gone, only the boxes go."""
+        if self.propagating:
+            self.gui.text('DELETE BOXES: wait for the run to finish or pause it first.')
+            return
+        frames = sorted(ti for ti, bars in self.bars_by_frame.items() if bars)
+        if not frames:
+            self.gui.text('No GUI boxes to delete.')
+            return
+        scope = self.gui.ask_reset_scale(
+            'GUI box(es)', len(frames), self.curr_ti in frames, self.curr_ti,
+            title='Delete GUI boxes',
+            note='The boxes are deleted, not the picture: frames you have already '
+                 'blanked stay blanked.')
+        if scope is None:
+            return
+        for ti in ([self.curr_ti] if scope == 'frame' else frames):
+            self.bars_by_frame.pop(ti, None)
+        self.bar_pending = None
+        gui_bar.save(self.res_man.workspace, self.bars_by_frame)
+        self._draw_scale_overlay()
+        self.gui.text('GUI boxes deleted on '
+                      + (f'frame {self.curr_ti}.' if scope == 'frame'
+                         else f'all {len(frames)} frame(s).'))
+
+    def on_blank_bars(self):
+        """Paint every frame's boxes black into <workspace>/images. Irreversible: those
+        files are what the networks, the overlay and the export all read."""
+        if self.propagating:
+            self.gui.text('BLANK FRAMES: wait for the run to finish or pause it first.')
+            return
+        frames = sorted(ti for ti, bars in self.bars_by_frame.items() if bars)
+        if not frames:
+            self.gui.text('BLANK FRAMES: draw a box first (COVER GUI), then TRACK it '
+                          'through the clip.')
+            return
+        if not self.gui.ask_blank_bars(len(frames)):
+            return
+        # the originals are copied aside ONCE, the first time anything is blanked: after
+        # that images/ is the blanked version and images_backup/ is what came out of the
+        # video, so a box drawn wrong is recoverable by copying the folder back
+        backup = path.join(self.res_man.workspace, 'images_backup')
+        if not path.exists(backup):
+            shutil.copytree(self.res_man.image_dir, backup)
+            self.gui.text(f'Originals copied to {backup}')
+        self.gui.text(f'Blanking {len(frames)} frame(s)...')
+        for i, ti in enumerate(frames):
+            file = self.res_man.image_path(ti)
+            im = np.array(Image.open(file).convert('RGB'))
+            gui_bar.blank(im, self.bars_by_frame[ti])
+            Image.fromarray(im).save(file, quality=95)
+            self.res_man.get_image.invalidate((ti,))
+            if i % 25 == 0:
+                self.gui.progressbar_update(i / len(frames))
+                self.gui.process_events()
+        self.gui.progressbar_update(0)
+        self._depth_cache.clear()       # the depth maps were computed on the old pixels
+        self.load_current_image_mask()
+        self.show_current_frame()
+        self.gui.text(f'BLANK FRAMES: {len(frames)} frame(s) painted black under their '
+                      'boxes; the originals are in images_backup/. The boxes are kept -- '
+                      'blanking again is harmless.')
+
+    def _bar_seed(self, ti, image):
+        """Take this frame's boxes as the reference: their interiors are what every later
+        frame is compared against. False if there are none."""
+        bars = self.bars_by_frame.get(ti, [])
+        self._bar_states = [{'bar': bar, 'patch': bar.interior(image)} for bar in bars]
+        return bool(self._bar_states)
+
+    def _bar_pass(self, ti, image):
+        """One frame of a TRACK run: copy each box onto this frame, unless its inside has
+        changed. Returns a stop message once it has (None while all is well).
+
+        The box does not move -- the console paints the bar at a fixed place, so what is
+        worth watching is not where the box is but WHAT IS UNDER IT. While the bar is
+        there the interior is the same pixels frame after frame; the first frame where it
+        is not is the frame the bar stopped being there, and the run ends rather than
+        blanking tissue for the rest of the clip. A frame whose boxes you drew by hand is
+        a keyframe: it is never overwritten, and the comparison re-seeds from it."""
+        if not self._bar_states:
+            return None
+        if any(b.source == 'manual' for b in self.bars_by_frame.get(ti, [])):
+            self._bar_seed(ti, image)
+            return None
+        drift = [gui_bar.changed(st['bar'].interior(image), st['patch'])
+                 for st in self._bar_states]
+        worst = max(drift)
+        if worst > gui_bar.CHANGE_TOL:
+            return (f'the inside of a GUI box changed at frame {ti} '
+                    f'({worst:.1f} gray levels, limit {gui_bar.CHANGE_TOL:g}) -- the bar '
+                    'is not there any more, so nothing past this frame was boxed. Check '
+                    'the frame: if the bar IS still there, draw the box again here and '
+                    'TRACK on.')
+        self.bars_by_frame[ti] = [st['bar'].copy() for st in self._bar_states]
+        return None
 
     # --- reference tracking (the scale page's TRACK buttons) -------------------------
     # Its own pass, like the arch's: only probe points are followed, so it is fast and it
@@ -1547,7 +1702,8 @@ class MainController():
             return
         # the arm rides along with its own tracker: four points, seeded below
         arm_on = self.curr_ti in self.arm_by_frame
-        if not self._scale_lines(self.curr_ti) and not arm_on:
+        bars_on = bool(self.bars_by_frame.get(self.curr_ti))
+        if not self._scale_lines(self.curr_ti) and not arm_on and not bars_on:
             self._set_scale_track_lit(None)
             self.gui.text('TRACK: draw a reference on this frame first (or click the '
                           'robot arm to measure it).')
@@ -1560,15 +1716,18 @@ class MainController():
             self.gui.text(f'TRACK: already at the {edge} frame.')
             return
         if not self._scale_seed(start, self.curr_image_np, self._occluder_mask(start)) \
-                and not arm_on:
+                and not arm_on and not bars_on:
             self._set_scale_track_lit(None)
             self.gui.text('TRACK: too little of the reference(s) is visible on this frame '
                           'to track (off-frame, or covered by instruments).')
             return
         if arm_on:
             self._arm_seed_track(start, self.curr_image_np)
+        if bars_on:
+            self._bar_seed(start, self.curr_image_np)
         names = ', '.join([scale_objects.class_name(s['cls']) for s in self._scale_states]
-                          + (['Robot arm (four points)'] if arm_on else []))
+                          + (['Robot arm (four points)'] if arm_on else [])
+                          + ([f'{len(self._bar_states)} GUI box(es)'] if bars_on else []))
         self.gui.text(f'TRACK {direction} from frame {start}: {names}. Click TRACK again '
                       'to pause; gray = lost grip, amber = the points disagreed. '
                       'Masks are not touched.'
@@ -1593,9 +1752,21 @@ class MainController():
                     break
                 image = self.res_man.get_image(t)
                 ok = self._scale_step(t, image, self._occluder_mask(t))
+                if bars_on:
+                    # the boxes end the run themselves, at the frame their inside changed
+                    stopped = self._bar_pass(t, image)
+                    if stopped:
+                        self.curr_ti = t
+                        break
+                    ok = True
                 if arm_on:
-                    self._arm_pass(t, image)
-                    ok = True           # the arm holds rather than stopping the run
+                    # the arm holds through an ordinary bad frame, but a jumped entry
+                    # point ends the run then and there -- see _arm_pass
+                    broke = self._arm_pass(t, image)
+                    if broke:
+                        stopped, self.curr_ti = broke, t
+                        break
+                    ok = True
                 self.curr_ti = t                    # show progress live
                 n += 1
                 if n % redraw_every == 0 or not ok:
@@ -1619,6 +1790,9 @@ class MainController():
             self.gui.tl_slider.setEnabled(True)
             self.gui.progressbar_update(0)
             self._save_scales()
+            if bars_on:
+                gui_bar.save(self.res_man.workspace, self.bars_by_frame)
+            self._bar_states = []
             # land on the last tracked frame (the redraw throttle may have skipped it)
             self.load_current_image_mask()
             self.show_current_frame()
@@ -1628,6 +1802,15 @@ class MainController():
                                    'TRACK again.'))
 
     def on_mouse_release(self):
+        if self.bar_pending is not None:
+            bar, self.bar_pending = self.bar_pending, None
+            if bar.big_enough():
+                self.bars_by_frame.setdefault(self.curr_ti, []).append(bar)
+                gui_bar.save(self.res_man.workspace, self.bars_by_frame)
+                self.gui.text(f'GUI box drawn on frame {self.curr_ti} '
+                              f'({bar.w:.0f}x{bar.h:.0f} px). TRACK carries it through the '
+                              'clip; BLANK FRAMES paints the boxes black into the frames.')
+            self._draw_scale_overlay()
         if self.arch_drag is not None:
             self.arch_drag = None
             self._save_arches()
@@ -2297,7 +2480,11 @@ class MainController():
         self._scale_states = []
         # scale_edit_points is deliberately NOT reset: it is a UI preference living in the
         # (reused) checkbox, and resetting it here would desync the two
-        self.scale_by_frame, self.scale_mm = scale_objects.load(self.res_man.workspace)
+        (self.scale_by_frame, self.scale_mm, self.arm_by_frame, self.arm_seed,
+         self.arm_calib) = scale_objects.load(self.res_man.workspace)
+        self._arm_state = None
+        self._arm_summary = None
+        self._arm_reconcile()
 
         # polygon tool state
         self.polygon_points = []
@@ -2373,6 +2560,11 @@ class MainController():
 
         # Dragging a scale reference: an end takes the cursor, a tracking point is
         # projected back onto the line (clamped coords -- references stay in the image)
+        if self.bar_pending is not None:
+            self.bar_pending = gui_bar.Bar(*self.bar_anchor, x, y)
+            self._draw_scale_overlay()
+            return
+
         if self.scale_drag is not None:
             scale_objects.move_handle(*self.scale_drag, x, y)
             self.scale_drag[0].source = 'manual'  # an adjusted frame is a TRACK keyframe
@@ -2382,13 +2574,14 @@ class MainController():
 
         # Dragging one of the robot arm's four points. Everything follows from them, so the
         # centerline, the scale line and the reading all move with the cursor -- you watch
-        # the number settle rather than clicking and hoping.
+        # the number settle rather than clicking and hoping. The two entry points take the
+        # frame size because they only slide ALONG the image edge they are on.
         if self.arm_drag:
             ann = self.arm_by_frame.get(self.curr_ti)
             if ann is None:
                 self.arm_drag = None
             else:
-                ann.move(self.arm_drag, x, y)
+                ann.move(self.arm_drag, x, y, (self.h, self.w))
                 self._draw_scale_overlay()
             return
 

@@ -331,6 +331,14 @@ class ResourceManager:
         image = np.array(image)
         return image
     
+    def image_path(self, ti: int):
+        """The file this frame was read from (.jpg or .png)."""
+        base_path = os.path.join(self.image_dir, self.names[ti])
+        for ext in ['.jpg', '.png']:
+            if os.path.exists(base_path + ext):
+                return base_path + ext
+        raise FileNotFoundError(f"No image found for {base_path}")
+
     def _get_image_unbuffered(self, ti: int):
         # returns H*W*3 uint8 array
         assert 0 <= ti < self.length

@@ -17,7 +17,7 @@ from pathlib import Path
 import json
 
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
-                               QTreeWidget, QTreeWidgetItem, QListWidget, QListWidgetItem,
+                               QTreeWidget, QTreeWidgetItem,
                                QLineEdit, QLabel, QPushButton, QDialogButtonBox)
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtCore import Qt
@@ -160,6 +160,23 @@ def _describe_status(count: int, present_label: str, missing_label: str) -> str:
     return f'{present_label} ({count})' if count else missing_label
 
 
+
+def _folder_node(tree, nodes, parts, labels):
+    """Get (creating on the way down) the folder row at `parts` -- one node per real
+    folder, so a tree reads like a file browser instead of one flat a/b/c label."""
+    node = nodes.get(parts)
+    if node is not None:
+        return node
+    node = QTreeWidgetItem([labels[-1], ''])
+    node.setFirstColumnSpanned(True)
+    if len(parts) > 1:
+        _folder_node(tree, nodes, parts[:-1], labels[:-1]).addChild(node)
+    else:
+        tree.addTopLevelItem(node)
+    nodes[parts] = node
+    return node
+
+
 class LoaderDialog(QDialog):
 
     def __init__(self, parent, raw_videos_root: str, workspace_root: str,
@@ -234,7 +251,9 @@ class LoaderDialog(QDialog):
 
     def _build_workspaces_tab(self) -> QWidget:
         w = QWidget()
-        self.workspace_list = QListWidget()
+        self.workspace_list = QTreeWidget()
+        self.workspace_list.setHeaderLabels(['Workspace', 'Frames'])
+        self.workspace_list.setColumnWidth(0, 430)
         self.workspace_list.itemSelectionChanged.connect(self._update_hint)
         self.workspace_list.itemDoubleClicked.connect(lambda *_: self._on_open())
 
@@ -268,26 +287,7 @@ class LoaderDialog(QDialog):
 
         # one node per real folder, nested like a file browser: roots at the top, each
         # sub-folder its own expandable node under its parent
-        nodes = {}          # (root_index, relative_dir) -> QTreeWidgetItem
-        n_folders = 0
-
-        def folder_node(vroot_i, stem, rel):
-            nonlocal n_folders
-            key = (vroot_i, rel)
-            node = nodes.get(key)
-            if node is not None:
-                return node
-            if rel == '':
-                node = QTreeWidgetItem([stem, ''])
-                self.video_tree.addTopLevelItem(node)
-            else:
-                head, tail = path.split(rel)
-                node = QTreeWidgetItem([tail, ''])
-                folder_node(vroot_i, stem, head).addChild(node)
-            node.setFirstColumnSpanned(True)
-            nodes[key] = node
-            n_folders += 1
-            return node
+        nodes = {}
 
         for vroot_i, vroot in enumerate(self.raw_videos_roots):
             stem = path.basename(vroot.rstrip(os.sep)) or vroot
@@ -297,7 +297,9 @@ class LoaderDialog(QDialog):
                 if not vids:
                     continue
                 rel = path.relpath(root, vroot)
-                parent = folder_node(vroot_i, stem, '' if rel == os.curdir else rel)
+                rel_parts = () if rel == os.curdir else tuple(rel.split(os.sep))
+                parent = _folder_node(self.video_tree, nodes,
+                                      (str(vroot_i),) + rel_parts, (stem,) + rel_parts)
                 for name in vids:
                     full = path.join(root, name)
                     ws = workspace_path_for_video(full, self.workspace_root,
@@ -322,7 +324,7 @@ class LoaderDialog(QDialog):
         # a couple of folders read better open; twenty of them read better shut, and
         # the filter box is how you find something in that case
         for node in nodes.values():
-            node.setExpanded(n_folders <= EXPAND_GROUPS)
+            node.setExpanded(len(nodes) <= EXPAND_GROUPS)
         for i in range(self.video_tree.topLevelItemCount()):
             self.video_tree.topLevelItem(i).setExpanded(True)
 
@@ -332,21 +334,27 @@ class LoaderDialog(QDialog):
             return
         # workspaces mirror the data folder tree, so they can sit any number of levels
         # deep; a folder with frames in it is a workspace and is not descended into
+        nodes = {}
         for root, dirs, _files in os.walk(self.workspace_root):
             n_frames = _has_frames(root)
             if not n_frames:
                 dirs.sort()
                 continue
             dirs.clear()
-            ws = root
-            name = path.relpath(ws, self.workspace_root).replace(os.sep, '/')
-            label = f'{name}   ({n_frames} frames)'
-            if self.current_workspace and path.normpath(ws) == self.current_workspace:
+            parts = tuple(path.relpath(root, self.workspace_root).split(os.sep))
+            label = f'{n_frames} frames'
+            if self.current_workspace and path.normpath(root) == self.current_workspace:
                 label += '   [current]'
-            item = QListWidgetItem(label)
-            item.setData(_ROLE_PATH, ws)
-            item.setData(_ROLE_KIND, 'workspace')
-            self.workspace_list.addItem(item)
+            item = QTreeWidgetItem([parts[-1], label])
+            item.setData(0, _ROLE_PATH, root)
+            item.setData(0, _ROLE_KIND, 'workspace')
+            if len(parts) > 1:
+                _folder_node(self.workspace_list, nodes,
+                             parts[:-1], parts[:-1]).addChild(item)
+            else:
+                self.workspace_list.addTopLevelItem(item)
+        for node in nodes.values():
+            node.setExpanded(len(nodes) <= EXPAND_GROUPS)
 
     # ---- filtering / hints ------------------------------------------------
 
@@ -378,8 +386,8 @@ class LoaderDialog(QDialog):
                 return items[0].data(0, _ROLE_PATH), items[0].data(0, _ROLE_KIND)
         else:
             item = self.workspace_list.currentItem()
-            if item is not None:
-                return item.data(_ROLE_PATH), item.data(_ROLE_KIND)
+            if item is not None and item.data(0, _ROLE_KIND):
+                return item.data(0, _ROLE_PATH), item.data(0, _ROLE_KIND)
         return None, None
 
     def _selected_any(self):
@@ -388,8 +396,8 @@ class LoaderDialog(QDialog):
         if items and items[0].data(0, _ROLE_KIND):
             return items[0].data(0, _ROLE_PATH), items[0].data(0, _ROLE_KIND)
         item = self.workspace_list.currentItem()
-        if item is not None:
-            return item.data(_ROLE_PATH), item.data(_ROLE_KIND)
+        if item is not None and item.data(0, _ROLE_KIND):
+            return item.data(0, _ROLE_PATH), item.data(0, _ROLE_KIND)
         return None, None
 
     def _update_hint(self, *_):

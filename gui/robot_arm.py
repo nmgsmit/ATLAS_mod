@@ -30,15 +30,26 @@ Everything drawn and exported follows from those four points:
                   shaft: the furthest point in the picture where 8 mm is something the
                   camera actually saw.
 
-TRACK carries the four points with segmenter.PointTracker -- the same tracker the ruler
-and the catheter tip use. Entry points that were sitting on the image border are put back
-onto it after each step, because that is what an entry point is. A frame you correct by
-hand is a keyframe: the tracker re-seeds there, and TRACK never overwrites it.
+The entry pair is ONE-DIMENSIONAL: each of the two lives on the image edge it entered
+across and only slides along it, whether you drag it or the tracker moves it. Across the
+edge is not a choice anybody gets to make, so nothing is allowed to make it.
 
-Trust is yours. Every frame carries a verdict, the automatic one only sets the initial
-state, and only frames left ON are exported. clip_scale() then reports what the clip
-agrees on and drops frames that disagree with their neighbours -- the arm is rigid, so its
-apparent width can only change as fast as the camera-arm distance does, which is slowly.
+TRACK carries the four points with segmenter.PointTracker -- the same tracker the ruler
+and the catheter tip use -- and puts the entry pair back on its edges after each step. A
+frame you correct by hand is a keyframe: the tracker re-seeds there, and TRACK never
+overwrites it. The run STOPS the moment an entry point moves further in one frame than
+the arm possibly could (ENTRY_DRIFT_PX): the entry pair is the far end of a long rigid
+arm and slides a few pixels a frame at most, so a bigger step is the tracker having let
+go, and every frame after it would be measured from the wrong place.
+
+Trust is yours, but it does not have to be checked by hand. clip_scale() drops a frame
+that disagrees with its NEIGHBOURS (noise) and, separately, one whose reading has JUMPED
+away from the last frame anybody believed (the points coming off the shaft). The second
+test is the one that matters on a tracked clip: when the points slide onto something else
+they stay there, so the neighbours agree and only the step from before the jump shows it.
+Everything after an unrecovered jump is dropped too -- go to the frame the readout names,
+put the four points back, and the chain re-anchors there. Every frame still carries a
+verdict of its own, the automatic one only sets the initial state, and yours is final.
 
 The GUI wiring (clicks, dragging, TRACK) lives in main_controller.py; annotations persist
 inside <workspace>/scale_objects.json, in a 'robot_arm' section beside the ordinary
@@ -99,9 +110,6 @@ CHORD_GAP_PX = 1.5             # px; a chord walks THROUGH gaps this short. A ma
 MAX_CHORD_PX = 400             # px; give up rather than walk forever off a broken mask
 MIN_DIAM_PX = 4.0              # below this the mask is too thin to measure honestly
 
-BORDER_SNAP_PX = 6.0           # px; a tracked entry point this close to the image edge is
-                               # put back onto it
-
 # Reconciling the clip. The arm is rigid and 8 mm, so its apparent width changes only as
 # fast as the camera-arm distance does: a frame that disagrees with its neighbours is
 # telling you about its own mask, not about the arm.
@@ -110,6 +118,44 @@ SMOOTH_WIN = 15                # frames of neighbouring MEASUREMENTS the local m
 OUTLIER_MAD = 3.0              # a frame this many MADs off its local median is not exported
 OUTLIER_FLOOR_PX = 0.5         # ... but never reject over less than this: half a pixel of
                                # disagreement on a rasterised boundary is not a fault.
+OUTLIER_FLOOR_FRAC = 0.10      # ... nor is this fraction of the local median, whatever the
+                               # MAD says. A rolling median LAGS a trend, so during a zoom
+                               # -- the one time the arm's width legitimately marches in
+                               # one direction -- every frame sits a little off its own
+                               # median and the ends of the clip sit a lot off, and a
+                               # tolerance chasing a small MAD throws them all away. The
+                               # frames it would drop there are not wrong, they are early.
+                               # Anything bigger than this band is the chain's job anyway.
+
+# The entry pair's speed limit, which stops a TRACK run rather than dropping a frame.
+# Where the arm crosses the border moves SLOWLY -- it is the far end of a long rigid arm
+# pivoting somewhere off-screen, so even a hard camera move slides it a few pixels a
+# frame. A bigger step than that is not the arm moving, it is the tracker having let go
+# and landed somewhere else, and every frame after it would be measured from the wrong
+# place. Better to stop and say so at the frame it happened than to carry on and leave a
+# hundred frames to be found later.
+ENTRY_DRIFT_PX = 8.0           # px one entry point may move between frames. Raise it for
+                               # a clip with genuinely violent camera motion -- the number
+                               # the run reports when it stops says how much it wanted.
+
+# The continuity chain -- the test the neighbourhood one above cannot make. A rolling
+# median compares a frame with its neighbours, so it catches a frame that is noisy and
+# misses a frame that is WRONG: when the points come off the shaft and stay off, the
+# neighbours come with them, the local median follows, and every frame from there on
+# agrees beautifully about the wrong thing. What that jump does show up in is the STEP
+# from the last frame anybody believed -- a rigid arm cannot change width abruptly, so a
+# reading that has, is not a reading of the arm.
+STEP_TOL = 0.15                # relative change from the last accepted frame that is
+                               # still the same arm. Generous next to the ~1-2% a real
+                               # zoom moves it between frames, because it has to pass the
+                               # per-frame noise the rolling median is there to handle --
+                               # this test is for the 30-100% jumps (the points landing on
+                               # a second instrument, the tip walking into the jaws), not
+                               # for the wobble.
+STEP_GAP_MAX = 5               # the tolerance grows with the gap between measured frames,
+                               # since the arm has had longer to move -- but only up to
+                               # this many frames, or a long unmeasured stretch would let
+                               # anything through on the far side of it.
 # --------------------------------------------------------------------------
 
 
@@ -287,7 +333,13 @@ def guess(comp):
     Two passes: aim from the entry midpoint at the component's centroid, walk the shaft,
     then re-aim along what the walk found and walk it again. One re-aim is enough -- the
     centroid of a tube is already within a couple of degrees of its axis, and the second
-    walk is aimed by the shaft itself."""
+    walk is aimed by the shaft itself.
+
+    The two pairs are then PAIRED UP: e0 with t0 on one side of the arm, e1 with t1 on the
+    other. They do not come out that way on their own -- the border run is read in the
+    image's own order while a chord is read along the axis's normal, so which is 'first'
+    flips with the direction the arm comes in from, and an arm entering from the right had
+    its two sides drawn crossing over each other."""
     pair = border_pair(comp)
     if pair is None:
         return None
@@ -302,21 +354,46 @@ def guess(comp):
             return None
         tip = found
         u = _unit(0.5 * (np.asarray(tip[0]) + np.asarray(tip[1])) - mid)
-    return (tuple(e0), tuple(e1), tip[0], tip[1])
+    return pair_up([tuple(e0), tuple(e1), tip[0], tip[1]])
 
 
-def snap_border(p, w, h, tol=BORDER_SNAP_PX):
-    """A point within tol of the image edge, put back ON that edge.
+def pair_up(pts):
+    """e0 with t0 on one side of the arm, e1 with t1 on the other: the four points with the
+    tip pair swapped if the two sides would otherwise be drawn crossing over each other.
 
-    An entry point belongs on the border by definition, but a tracker following one has
-    half its template outside the picture and creeps inward. A point dragged well clear of
-    the edge is left alone -- that is somebody saying the arm does not reach it there."""
-    x, y = float(p[0]), float(p[1])
-    d = [x, w - 1 - x, y, h - 1 - y]
-    i = int(np.argmin(d))
-    if d[i] > tol:
-        return (x, y)
-    return [(0.0, y), (float(w - 1), y), (x, 0.0), (x, float(h - 1))][i]
+    Needed because the two pairs are read in unrelated orders -- the entry pair along the
+    image border, the tip pair along the axis's own normal -- so which of the two counts as
+    'first' flips with the direction the arm comes in from. Applied where the points are
+    BUILT (off the mask, or off a saved record), never where they are moved: the tracker
+    and the mouse both address a point by its index, and quietly renaming one mid-drag
+    would be worse than an X on the screen."""
+    p = [np.asarray(q, np.float64) for q in pts]
+    n = _perp(_unit(0.5 * (p[2] + p[3]) - 0.5 * (p[0] + p[1])))
+    if float((p[0] - p[1]) @ n) * float((p[2] - p[3]) @ n) < 0:
+        p[2], p[3] = p[3], p[2]
+    return tuple(tuple(float(z) for z in q) for q in p)
+
+
+def edge_of(p, shape):
+    """Which image edge p sits on (or is nearest): 0 left, 1 right, 2 top, 3 bottom."""
+    h, w = shape[0], shape[1]
+    return int(np.argmin([p[0], w - 1 - p[0], p[1], h - 1 - p[1]]))
+
+
+def on_edge(p, edge, shape):
+    """p put ON that image edge: the coordinate ACROSS the edge is pinned to it, the one
+    ALONG it is kept (clamped into the picture).
+
+    This is what makes an entry point one-dimensional. It is where the arm crosses the
+    border, so it has exactly one degree of freedom -- where along that border -- and both
+    the hand and the tracker are held to it. A tracker following a point at the picture's
+    edge has half its template outside and creeps inward; a mouse cannot be dragged to a
+    subpixel line at all. Neither has to be accurate across the edge, because across the
+    edge is not a choice anybody gets to make."""
+    h, w = shape[0], shape[1]
+    x = float(np.clip(p[0], 0.0, w - 1))
+    y = float(np.clip(p[1], 0.0, h - 1))
+    return [(0.0, y), (float(w - 1), y), (x, 0.0), (x, float(h - 1))][edge]
 
 
 # --- one frame's annotation -----------------------------------------------
@@ -404,22 +481,40 @@ class ArmMeasure:
                 best, best_d = name, d
         return best
 
-    def move(self, name, x, y):
+    def move(self, name, x, y, shape=None):
         """Drag one point. The frame becomes a keyframe: TRACK re-seeds here and never
-        overwrites it."""
-        self.pts[self.NAMES.index(name)] = (float(x), float(y))
+        overwrites it.
+
+        An ENTRY point only slides ALONG the image edge it is on -- one dimension, because
+        that is all the arm's crossing of the border has. shape is (h, w); without it the
+        point moves freely, which is only ever right for the tip pair."""
+        i = self.NAMES.index(name)
+        if i < 2 and shape is not None:
+            self.pts[i] = on_edge((x, y), edge_of(self.pts[i], shape), shape)
+        else:
+            self.pts[i] = (float(x), float(y))
         self.manual = True
         self.source = 'manual'
         return self
+
 
     def points(self):
         """The four points as a list, for the tracker."""
         return list(self.pts)
 
-    def moved_to(self, pts, source='tracked'):
+    def moved_to(self, pts, source='tracked', shape=None):
         """The same annotation with its four points somewhere else -- what TRACK produces.
+
+        Given shape (h, w), the entry pair is put back onto the edges THIS annotation's
+        entry pair was on: the arm goes on entering the picture across the same border it
+        crossed last frame, and a tracker is not entitled to an opinion about that.
+
         The verdict does NOT travel: it belongs to the frame it was given on, and the
         caller carries the target frame's own with adopt_verdict."""
+        pts = list(pts)
+        if shape is not None:
+            for i in (0, 1):
+                pts[i] = on_edge(pts[i], edge_of(self.pts[i], shape), shape)
         return ArmMeasure(pts, source=source)
 
     # --- the verdict ------------------------------------------------------
@@ -493,9 +588,20 @@ class ArmMeasure:
         edge-fitting tool. Re-measure the clip rather than guess at what it meant."""
         if not d or 'entry' not in d or 'tip' not in d:
             return None
-        return ArmMeasure(list(d['entry']) + list(d['tip']), d.get('trusted'),
+        return ArmMeasure(pair_up(list(d['entry']) + list(d['tip'])), d.get('trusted'),
                           d.get('trusted_by', 'auto'), d.get('source', 'auto'),
                           d.get('manual', False))
+
+
+def entry_drift(prev, cur):
+    """How far the entry pair moved between two frames: the larger of the two, in px.
+
+    The one number that says the tracker has let go. The entry pair is pinned to the image
+    border and slides along it slowly, so unlike the tip pair it has no legitimate reason
+    to move far in one frame -- which makes it the honest early warning for the whole
+    annotation, since everything else is measured from where it sits."""
+    return max(float(np.hypot(cur.pts[i][0] - prev.pts[i][0],
+                              cur.pts[i][1] - prev.pts[i][1])) for i in (0, 1))
 
 
 def measure_frame(mask, seeds=()):
@@ -516,6 +622,47 @@ def _local_median(d, window):
     return np.array([np.median(d[max(0, i - half):i + half + 1]) for i in range(len(d))])
 
 
+def _anchor(manual):
+    """Where the continuity chain starts: the first frame placed by hand, else the first
+    measured one. A frame you placed IS the statement of what the arm looks like, which is
+    exactly what a chain needs at its head -- and it is why the chain can run outward in
+    both directions from it, instead of having to assume the clip was annotated forwards."""
+    hands = [i for i, m in enumerate(manual) if m]
+    return hands[0] if hands else 0
+
+
+def _chain(d, frames, keep, manual, start, tol=STEP_TOL, gap_max=STEP_GAP_MAX):
+    """Drop every frame whose reading has jumped away from the last one accepted before it.
+
+    Walked outward from `start` in both directions, and the reference is the last ACCEPTED
+    frame rather than the immediately previous one: a single bad frame is then dropped on
+    its own, while a jump the tracker never comes back from drops everything past it --
+    which is the point. If it does come back, the frames that agree with the anchor again
+    are accepted again, because the reference never moved to the wrong value.
+
+    Returns the positions dropped, in frame order."""
+    dropped = []
+    for order in (range(start, len(frames)), range(start, -1, -1)):
+        ref, prev_t = d[start], frames[start]
+        for i in order:
+            if i == start:
+                continue
+            # the tolerance grows over frames nobody MEASURED, where the arm had time to
+            # move unwatched -- never over frames just rejected, or a sustained jump would
+            # widen its own way back in after three frames of being caught
+            gap = min(abs(frames[i] - prev_t), gap_max)
+            prev_t = frames[i]
+            if manual[i]:               # a frame you placed by hand re-anchors the chain
+                ref = d[i]
+                continue
+            if ref > 0 and abs(d[i] - ref) > tol * gap * ref:
+                keep[i] = False
+                dropped.append(i)
+            elif keep[i]:
+                ref = d[i]
+    return sorted(dropped)
+
+
 def clip_scale(arm_by_frame, window=SMOOTH_WIN, k=OUTLIER_MAD, calib=1.0):
     """Reconcile every frame's diameter against the rest of the clip.
 
@@ -523,9 +670,12 @@ def clip_scale(arm_by_frame, window=SMOOTH_WIN, k=OUTLIER_MAD, calib=1.0):
 
       ann.clip_diameter   the diameter to EXPORT -- the local median of the neighbouring
                           frames' readings, times calib. None where the frame has none.
-      ann.trusted         whether this frame is exported at all. Set from the outlier test,
-                          EXCEPT on frames whose verdict you gave yourself (trusted_by ==
-                          'user'), which are left exactly as you left them.
+      ann.trusted         whether this frame is exported at all. A frame has to pass two
+                          tests: it must agree with its NEIGHBOURS (the outlier test, for
+                          noise) and it must not have JUMPED away from the last frame
+                          anybody believed (_chain, for the points coming off the shaft and
+                          staying off). Frames whose verdict you gave yourself (trusted_by
+                          == 'user') are left exactly as you left them either way.
 
     calib is a single multiplier for the whole clip -- the one knob for a mask that is
     systematically fat or thin, which no per-frame geometry can see. 1.0 leaves the
@@ -533,7 +683,8 @@ def clip_scale(arm_by_frame, window=SMOOTH_WIN, k=OUTLIER_MAD, calib=1.0):
     frames = sorted(t for t, a in arm_by_frame.items() if a is not None and a.measured)
     summary = {'n_measured': len(frames), 'n_exported': 0, 'n_rejected': 0,
                'median_px': 0.0, 'mm_per_px': 0.0, 'scatter_px': 0.0, 'scatter_pct': 0.0,
-               'raw_scatter_pct': 0.0, 'calib': float(calib)}
+               'raw_scatter_pct': 0.0, 'calib': float(calib),
+               'n_broken': 0, 'break_at': None, 'anchor': None}
     for a in arm_by_frame.values():
         if a is not None:
             a.clip_diameter = None
@@ -543,8 +694,15 @@ def clip_scale(arm_by_frame, window=SMOOTH_WIN, k=OUTLIER_MAD, calib=1.0):
     med = _local_median(d, window)
     resid = np.abs(d - med)
     mad = float(np.median(resid))
-    tol = max(k * mad, OUTLIER_FLOOR_PX)
+    tol = np.maximum(max(k * mad, OUTLIER_FLOOR_PX), OUTLIER_FLOOR_FRAC * med)
     keep = resid <= tol
+    # ... and then the continuity chain, which is a different question: not "is this frame
+    # noisy" but "is this still the same measurement". A frame has to pass both.
+    manual = [arm_by_frame[t].manual for t in frames]
+    start = _anchor(manual)
+    broke = _chain(d, frames, keep, manual, start)
+    summary.update(n_broken=len(broke), anchor=frames[start],
+                   break_at=frames[broke[0]] if broke else None)
     for t, m, ok in zip(frames, med, keep):
         ann = arm_by_frame[t]
         ann.clip_diameter = float(m) * float(calib)
@@ -679,6 +837,19 @@ if __name__ == '__main__':
     assert ann.end[0] < 200, f'tip pair walked into the jaws: {ann.end}'
     assert abs(ann.mm_per_px - ARM_MM / ann.diameter) < 1e-9
 
+    # the two sides must not cross, whichever border the arm comes in from. e0 pairs with
+    # t0 and e1 with t1, so both have to sit on the SAME side of the centerline -- an arm
+    # entering from the right used to come out with its side lines drawn in an X.
+    for k in range(4):
+        m = np.rot90(scene(w=400, h=400, y0=200, shaft=300), k)
+        a = measure_frame(np.ascontiguousarray(m))
+        assert a is not None, f'no arm after {k} quarter-turns'
+        n, start, end = a.n, np.asarray(a.start), np.asarray(a.end)
+        side_e = float((np.asarray(a.pts[0]) - start) @ n)
+        side_t = float((np.asarray(a.pts[2]) - end) @ n)
+        assert side_e * side_t > 0, f'sides crossed entering from border {k}: {a.pts}'
+        assert abs(a.diameter - 21) < 2, (k, a.diameter)
+
     # THE property: a tilted arm is measured SQUARE to its own axis. The mask is drawn as
     # columns 21 px tall, so its true width across is 21*cos(atan(dy)) -- read down the
     # column instead and it comes out 12% too wide, which is a millimetre of scale error.
@@ -703,12 +874,41 @@ if __name__ == '__main__':
     # round-trip, and an old-format record loads as nothing rather than as a guess
     back = ArmMeasure.from_dict(ann.to_dict())
     assert back.pts == ann.pts and back.trusted == ann.trusted
+    crossed = ann.to_dict()                     # a record saved with its sides crossed
+    crossed['tip'] = crossed['tip'][::-1]       # comes back straight
+    assert ArmMeasure.from_dict(crossed).pts == ann.pts
     assert ArmMeasure.from_dict({'start': [0, 0], 'end': [10, 0]}) is None
 
-    # a tracked entry point gets put back on the border it crept off; one dragged well
-    # clear of the edge is left where it was put
-    assert snap_border((2.0, 130.0), 320, 240) == (0.0, 130.0)
-    assert snap_border((160.0, 130.0), 320, 240) == (160.0, 130.0)
+    # THE entry constraint: one dimension. Dragging an entry point sideways off its edge
+    # only slides it along the edge; dragging a tip point moves it wherever you put it.
+    shape = (240, 320)
+    e = measure_frame(scene())
+    e.move('e0', 40.0, 150.0, shape)
+    assert e.pts[0] == (0.0, 150.0), e.pts[0]         # x pinned to the left edge it is on
+    e.move('e0', -10.0, 999.0, shape)
+    assert e.pts[0] == (0.0, 239.0), e.pts[0]         # ... and clamped into the picture
+    e.move('t0', 40.0, 150.0, shape)
+    assert e.pts[2] == (40.0, 150.0), e.pts[2]        # a tip point is free
+    # the same holds for a tracker: the entry pair goes back on the edge it entered across,
+    # however far the tracked position crept off it
+    drifted = e.moved_to([(7.0, 120.0), (4.0, 140.0), (180.0, 110.0), (180.0, 130.0)],
+                         shape=shape)
+    assert drifted.pts[0] == (0.0, 120.0) and drifted.pts[1] == (0.0, 140.0), drifted.pts
+    # an arm entering the bottom is held to the bottom, not to whatever is nearest
+    bot = ArmMeasure([(100.0, 239.0), (120.0, 239.0), (110.0, 80.0), (130.0, 80.0)])
+    assert bot.moved_to([(103.0, 232.0), (123.0, 231.0), (110.0, 70.0), (130.0, 70.0)],
+                        shape=shape).pts[0] == (103.0, 239.0)
+
+    # the entry pair's speed limit: it slides a few px a frame, so a big step is the
+    # tracker having let go. Measured on the pair only -- the tip is free to move.
+    base = measure_frame(scene())
+    crept = base.moved_to([(0.0, 113.0), (0.0, 133.0), (250.0, 60.0), (250.0, 200.0)],
+                          shape=shape)
+    assert entry_drift(base, crept) == 3.0, entry_drift(base, crept)
+    assert entry_drift(base, crept) < ENTRY_DRIFT_PX      # a big tip move is not a let-go
+    jumped = base.moved_to([(0.0, 150.0), (0.0, 133.0), (180.0, 110.0), (180.0, 130.0)],
+                           shape=shape)
+    assert entry_drift(base, jumped) > ENTRY_DRIFT_PX, entry_drift(base, jumped)
 
     # the clip: one frame measuring something else is dropped, the rest are exported
     clip = {t: measure_frame(scene()) for t in range(20)}
@@ -721,6 +921,58 @@ if __name__ == '__main__':
     clip[3].toggle(False)
     clip_scale(clip)
     assert not clip[3].trusted and clip[3].trusted_by == 'user'
+
+    # THE continuity chain. A tracker that jumps at frame 12 and never comes back takes
+    # its neighbours with it, so the rolling median is happy from 12 on -- only the STEP
+    # away from frame 11 shows that the points left the arm.
+    def run(n=24, jump_at=None, jump=1.5, until=None, hands=()):
+        c = {}
+        for t in range(n):
+            a = measure_frame(scene())
+            if jump_at is not None and t >= jump_at and (until is None or t < until):
+                x, y = a.pts[2]
+                a.pts[2] = (x, y - (jump - 1.0) * a.diameter)   # widen the tip chord
+            a.manual = t in hands
+            c[t] = a
+        return c
+
+    c = run(jump_at=12)
+    s = clip_scale(c)
+    assert all(c[t].trusted for t in range(12)), 'the good half must survive'
+    assert not any(c[t].trusted for t in range(12, 24)), 'a jump drops what follows it'
+    assert s['break_at'] == 12 and s['n_broken'] == 12 and s['anchor'] == 0
+
+    # a jump the tracker DOES come back from costs only the frames it was away for: the
+    # reference never moved onto the wrong value, so the recovered frames match it again
+    c = run(jump_at=12, until=15)
+    clip_scale(c)
+    assert [t for t in range(24) if not c[t].trusted] == [12, 13, 14]
+
+    # a real zoom is GRADUAL, and the chain must not fire on one: the arm gets 70% wider
+    # over the clip, 3% at a time, and every frame is still believed
+    c = {}
+    for t in range(24):
+        a = measure_frame(scene())
+        x, y = a.pts[2]
+        a.pts[2] = (x, y - 0.03 * t * a.diameter)
+        c[t] = a
+    clip_scale(c)
+    assert all(c[t].trusted for t in range(24)), 'a gradual zoom is not a jump'
+
+    # a frame you place by hand re-anchors the chain, and the side you signed for is the
+    # side that is believed
+    c = run(jump_at=12, hands=(12,))
+    s = clip_scale(c)
+    assert s['anchor'] == 12
+    assert [t for t in range(24) if not c[t].trusted] == list(range(12))
+
+    # the chain walks OUTWARD from the frame you placed by hand, not forwards from frame 0
+    # -- so tracking backwards from your keyframe drops the wrong side of a jump, not the
+    # right one
+    c = run(jump_at=0, until=8, hands=(16,))
+    s = clip_scale(c)
+    assert s['anchor'] == 16
+    assert [t for t in range(24) if not c[t].trusted] == list(range(8)),         [t for t in range(24) if not c[t].trusted]
     # ... and what is exported is exactly what is drawn
     line = clip[0].to_scale_line()
     assert abs(line.length_px - clip[0].export_diameter) < 1e-6

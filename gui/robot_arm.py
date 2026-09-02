@@ -14,10 +14,19 @@ FOUR POINTS say everything, and nothing else is fitted:
     (t0, t1)      far end of the tool, which flares and bends and is not 8 mm across.
 
 They are guessed off the instrument mask and then dragged wherever the guess was wrong.
-The guess: the arm crosses the border, so on that border its mask is an interval and the
-interval's two ends are the entry pair; from their midpoint the mask's perpendicular chord
-is walked outward, and the shaft ends at the first station whose width leaves the shaft's
-own (the wrist flaring, or the jaws opening).
+The guess walks the mask's perpendicular chord outward from the border, and the shaft ends
+at the first station whose width leaves the shaft's own (the wrist flaring, or the jaws
+opening) -- that chord is the tip pair.
+
+The ENTRY pair is not read off the mask at the border, though, and this is the one place
+the mask must not be believed: a segmentation does not draw the arm meeting the border at
+an angle, it draws a curve into it, so the ends of its border run sit well inside the real
+corner (40 px in, for a 40 px rounding). The arm's silhouette does not curve -- a
+cylinder's sides are straight lines -- so each side is FITTED over the clean stretch of
+shaft and followed back until it leaves the picture. Where it leaves is the corner. That
+needs no assumption about which border it leaves through, which matters for an arm
+crossing an image corner: its two sides go out through two different borders, and that is
+exactly the case reading a single border run gets most wrong.
 
 Everything drawn and exported follows from those four points:
 
@@ -41,6 +50,20 @@ overwrites it. The run STOPS the moment an entry point moves further in one fram
 the arm possibly could (ENTRY_DRIFT_PX): the entry pair is the far end of a long rigid
 arm and slides a few pixels a frame at most, so a bigger step is the tracker having let
 go, and every frame after it would be measured from the wrong place.
+
+What the tracker does NOT decide is the width. A cylinder's two edges are smooth along
+their length, so no tracker can tell how far apart they have got -- handed a pair of edge
+points it carries them along at the width it was given, and an arm coming visibly closer
+reports the same diameter on every frame. So on each tracked frame the tip pair is put
+back onto the MASK's own chord at the station the tracker left it at (snap_width): the
+tracker chooses where along the arm to measure, the segmentation says how wide the arm is
+there, and the millimetres per pixel move with the arm the way they should.
+
+Every frame exports its OWN reading. The neighbouring frames decide WHETHER a frame is
+exported, never WHAT it exports: the arm is a per-frame scale paired with a per-frame
+depth map, and a neighbourhood median would hand a depth estimator the scale of a
+different moment -- on a moving camera, smoothing away the very change the reference is
+there to record.
 
 Trust is yours, but it does not have to be checked by hand. clip_scale() drops a frame
 that disagrees with its NEIGHBOURS (noise) and, separately, one whose reading has JUMPED
@@ -95,6 +118,22 @@ MAX_MISSES = 3                 # consecutive stations off the mask before the wa
                                # up. Not 1: a notch in the boundary must not stop it
                                # short. Not unlimited: a second blob further down the axis
                                # is not this arm and must not be walked to.
+# Placing the two corners, where the arm crosses the border. Read off the arm's SIDES
+# rather than off the mask there: a segmentation rounds that corner into a curve, and the
+# arm's silhouette does not curve -- it is a straight edge running into a straight edge.
+CORNER_SKIP_FRAC = 0.5         # of the shaft's WIDTH: how deep the rounded stretch runs,
+                               # and so how much of the shaft nearest the border is left
+                               # out of the side fit. About the arm's own radius, which is
+                               # what a mask's corner rounding tends to measure.
+SIDE_MIN_PTS = 3               # stations a side needs before a line through it means
+                               # anything. Below that the mask's own corner is used --
+                               # rounded, but not invented.
+CORNER_MAX_FRAC = 1.5          # of the width: how far the fitted corner may sit from where
+                               # the mask meets the border before the fit is disbelieved.
+                               # A sanity bound, not a precision one -- the correction is
+                               # normally a few px, and anything way out is a broken fit
+                               # rather than a better answer.
+
 BACK_OFF = 1                   # stations to step back from the last good one. The chord
                                # before a flare is already half into the joint, and the
                                # last chord of an arm that simply ends clips its end cap
@@ -113,8 +152,23 @@ MIN_DIAM_PX = 4.0              # below this the mask is too thin to measure hone
 # Reconciling the clip. The arm is rigid and 8 mm, so its apparent width changes only as
 # fast as the camera-arm distance does: a frame that disagrees with its neighbours is
 # telling you about its own mask, not about the arm.
+#
+# Note what the neighbours are used FOR: deciding whether to believe a frame, and nothing
+# else. Every frame exports its OWN reading. The arm is a per-frame scale reference paired
+# with a per-frame depth map, so handing out a neighbourhood median would be answering a
+# question nobody asked -- and on a moving camera it answers it wrongly, by smoothing away
+# the very thing the reference is there to measure. Whoever consumes the export can smooth
+# it if they want to; they cannot un-smooth it.
 SMOOTH_WIN = 15                # frames of neighbouring MEASUREMENTS the local median is
-                               # taken over. Counted in measured frames, not frame numbers.
+                               # taken over, at MOST -- see _window, which shrinks it on a
+                               # short annotation. Counted in measured frames, not frame
+                               # numbers.
+WINDOW_FRAC = 3                # ... and never wider than this fraction of the annotation.
+                               # A window that spans the whole clip is not a rolling median
+                               # at all, it is the global one: every frame then gets tested
+                               # against the same number, a real trend reads as everybody
+                               # being an outlier at the ends, and with the old smoothed
+                               # export it made a 9-frame clip report one constant scale.
 OUTLIER_MAD = 3.0              # a frame this many MADs off its local median is not exported
 OUTLIER_FLOOR_PX = 0.5         # ... but never reject over less than this: half a pixel of
                                # disagreement on a rasterised boundary is not a fault.
@@ -294,13 +348,14 @@ def chord_at(comp, center, perp):
 
 # --- the guess ------------------------------------------------------------
 
-def _shaft_end(comp, mid, u):
-    """(p0, p1): the ends of the last chord along +u from mid that is still the SHAFT.
+def _shaft(comp, mid, u):
+    """The shaft, as the perpendicular chords along it: (chords, step, width) or None.
 
-    Chords are collected outward until the mask runs out, the shaft's own width is the
-    median of the first few, and the shaft ends at the first station that departs from it
-    by FLARE_TOL -- the wrist swelling, or the jaws opening into two half-width pieces
-    that a single chord reads as one wide one."""
+    Chords are collected outward from mid until the mask runs out, the shaft's own width
+    is the median of the first few, and the list is cut at the first station that departs
+    from that width by FLARE_TOL -- the wrist swelling, or the jaws opening into two
+    half-width pieces that a single chord reads as one wide one. The last chord left is
+    the tip; all of them together are the two sides."""
     n = _perp(u)
     reach = float(np.hypot(*comp.shape))
     step = max(SHAFT_STEP, reach / MAX_STATIONS)
@@ -323,8 +378,68 @@ def _shaft_end(comp, mid, u):
         if abs(c[2] - ref) > FLARE_TOL * ref:
             keep = i
             break
-    c = chords[max(0, keep - 1 - BACK_OFF)]
-    return c[0], c[1]
+    return chords[:max(1, keep - BACK_OFF)], step, ref
+
+
+def _exit(p, v, shape):
+    """Where the ray from p along v leaves the image: (x, y), or None if it never does."""
+    h, w = float(shape[0] - 1), float(shape[1] - 1)
+    p = np.asarray(p, np.float64)
+    best = None
+    for axis, lim in ((0, 0.0), (0, w), (1, 0.0), (1, h)):
+        if abs(v[axis]) < 1e-9:
+            continue
+        t = (lim - p[axis]) / v[axis]
+        if t <= 0:
+            continue
+        q = p + t * v
+        other = 1 - axis
+        if -0.5 <= q[other] <= (w if other == 0 else h) + 0.5:
+            if best is None or t < best[0]:
+                best = (t, q)
+    return None if best is None else (float(best[1][0]), float(best[1][1]))
+
+
+def _corners(chords, step, width, u, shape, raw):
+    """Where the arm crosses the image border, read off its SIDES instead of off the
+    mask's own corner: (side 0's point, side 1's point), or None if there is too little
+    clean shaft to fit.
+
+    A segmentation rounds that corner off. The arm's side does not actually curve into the
+    border -- it is a straight edge meeting a straight edge -- so the last stretch of mask
+    before the border is the one place the mask is guaranteed to be wrong, and taking the
+    corner from it puts the point a few pixels inside the picture, sitting on neither line.
+
+    So each side of the shaft is fitted as the straight line a cylinder's silhouette is
+    (skipping the rounded stretch, which is about the arm's own radius deep) and followed
+    back out of the picture. Where it leaves IS the corner, and it needs no assumption
+    about WHICH border that is -- an arm entering across an image corner has one side
+    leaving through one border and the other side through the other, which is exactly
+    where the mask's rounding is worst and the ends of a single border run are furthest
+    from the truth.
+
+    `raw` is the mask's own answer, kept as a sanity bound: a fit that puts the corner
+    nowhere near where the mask does is not a better answer, it is a broken one."""
+    skip = int(np.ceil(CORNER_SKIP_FRAC * width / step))
+    skip = min(skip, max(0, len(chords) - SIDE_MIN_PTS))
+    pts = chords[skip:]
+    if len(pts) < SIDE_MIN_PTS:
+        return None
+    out = []
+    for side in (0, 1):
+        p = np.array([c[side] for c in pts], np.float32)
+        # Huber rather than plain least squares: a nick in the mask boundary is one bad
+        # point on an otherwise straight edge, and it must not tilt the whole line
+        vx, vy, x0, y0 = cv2.fitLine(p, cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+        v = np.array([vx, vy])
+        if float(v @ u) > 0:        # follow it BACK to the border, not on out along the arm
+            v = -v
+        q = _exit(np.array([x0, y0]), v, shape)
+        if q is None or min(float(np.hypot(q[0] - r[0], q[1] - r[1]))
+                            for r in raw) > CORNER_MAX_FRAC * width:
+            return None
+        out.append(q)
+    return out[0], out[1]
 
 
 def guess(comp):
@@ -347,13 +462,20 @@ def guess(comp):
     mid = 0.5 * (e0 + e1)
     ys, xs = np.nonzero(comp)
     u = _unit(np.array([xs.mean(), ys.mean()]) - mid)
-    tip = None
+    shaft = None
     for _ in range(2):
-        found = _shaft_end(comp, mid, u)
-        if found is None:
+        shaft = _shaft(comp, mid, u)
+        if shaft is None:
             return None
-        tip = found
+        tip = shaft[0][-1]
         u = _unit(0.5 * (np.asarray(tip[0]) + np.asarray(tip[1])) - mid)
+    chords, step, width = shaft
+    tip = chords[-1]
+    # the corners come off the SIDES, not off the mask's rounded border run -- and when
+    # they do they are already paired with the tip, both being read side-for-side
+    corners = _corners(chords, step, width, u, comp.shape, (e0, e1))
+    if corners is not None:
+        return pair_up([corners[0], corners[1], tip[0], tip[1]])
     return pair_up([tuple(e0), tuple(e1), tip[0], tip[1]])
 
 
@@ -411,11 +533,11 @@ class ArmMeasure:
         self.manual = bool(manual)      # placed by hand here -> a TRACK keyframe
         self.trusted_by = trusted_by    # 'auto' (the verdict) | 'user' (you said so)
         self.trusted = self.measured if trusted is None else bool(trusted and self.measured)
-        # What this frame EXPORTS: its own reading reconciled against the neighbouring
-        # frames and scaled by the clip's calibration (see clip_scale). None until the clip
-        # has been reconciled; self.diameter stays the raw reading, so the two can always
-        # be compared.
-        self.clip_diameter = None
+        # What this frame EXPORTS: its own reading, times the clip's calibration (see
+        # clip_scale). None until the clip has been reconciled, and then the number that is
+        # drawn and written out; self.diameter stays the uncalibrated reading, so the two
+        # can always be compared.
+        self.export_px = None
 
     # --- geometry ---------------------------------------------------------
     @property
@@ -539,8 +661,8 @@ class ArmMeasure:
     # --- export -----------------------------------------------------------
     @property
     def export_diameter(self):
-        """The diameter that is drawn and written out (clip-reconciled where available)."""
-        return float(self.clip_diameter) if self.clip_diameter else self.diameter
+        """The diameter that is drawn and written out: this frame's own, calibrated."""
+        return float(self.export_px) if self.export_px else self.diameter
 
     @property
     def export_mm_per_px(self):
@@ -549,8 +671,8 @@ class ArmMeasure:
 
     def export_chord(self):
         """The scale line as exported: the chord at the tip, resized about its own midpoint
-        to the clip-reconciled diameter. Resized rather than redrawn so that what is on
-        screen is exactly what is written out -- the one rule this overlay has."""
+        to the calibrated diameter. Resized rather than redrawn so that what is on screen
+        is exactly what is written out -- the one rule this overlay has."""
         c = np.asarray(self.end)
         half = 0.5 * self.export_diameter * self.n
         return (tuple(float(z) for z in c - half), tuple(float(z) for z in c + half))
@@ -591,6 +713,81 @@ class ArmMeasure:
         return ArmMeasure(pair_up(list(d['entry']) + list(d['tip'])), d.get('trusted'),
                           d.get('trusted_by', 'auto'), d.get('source', 'auto'),
                           d.get('manual', False))
+
+
+def snap_width(ann, comp):
+    """The same annotation with its tip pair put back onto the MASK's own chord, at the
+    station along the arm the tracker left it at. Unchanged if there is nothing there.
+
+    This is what makes a tracked clip measure anything at all, and it is the one thing the
+    tracker must not be asked to do. A tracker follows a patch of image: it can say where
+    the end of the shaft has moved to, but a cylinder's two edges are smooth and
+    featureless ALONG their length, so nothing in the picture tells it how far apart they
+    now are. Handed a pair of edge points it carries them along at the width it was given
+    and reports the same diameter on every frame -- through a zoom that is visibly making
+    the arm wider.
+
+    So the two are given the jobs they are actually good at: the tracker chooses WHERE
+    along the arm to measure, which is a question about position and needs no subpixel
+    accuracy across the shaft, and the segmentation says how wide the arm is there, which
+    is a question about the silhouette and is exactly what a mask is. The entry pair is
+    left alone -- snap it to the border run too if the axis ever needs locking to the mask
+    as well, but that would overwrite an entry you had placed by hand."""
+    if comp is None:
+        return ann
+    c = chord_at(comp, ann.end, ann.n)
+    if c is None or c[2] < MIN_DIAM_PX:
+        return ann              # the tip is off the mask: keep what the tracker gave
+    pts = pair_up(list(ann.pts[:2]) + [c[0], c[1]])
+    ann.pts[2], ann.pts[3] = pts[2], pts[3]
+    return ann
+
+
+def station_frac(ann, comp):
+    """Where this annotation's tip sits along the shaft, as a fraction in [0,1]: 0 at the
+    border, 1 at the end of the straight shaft. None if the shaft cannot be walked here.
+
+    A fraction rather than a distance, because a fraction is what survives the arm moving.
+    Pixels do not: when the arm comes closer the whole silhouette scales, so the same
+    physical cross-section sits further from the border in pixels than it did -- and
+    holding the station at a fixed pixel depth would slide it down the arm exactly when the
+    scale is changing. The fraction is the same physical place whatever the depth."""
+    got = _shaft(comp, ann.start, ann.u) if comp is not None else None
+    if got is None or len(got[0]) < 2:
+        return None
+    u, s = ann.u, np.asarray(ann.start, np.float64)
+    last = got[0][-1]
+    end = 0.5 * (np.asarray(last[0]) + np.asarray(last[1]))
+    full = float((end - s) @ u)
+    if full < 1.0:
+        return None
+    return float(np.clip(float((np.asarray(ann.end) - s) @ u) / full, 0.0, 1.0))
+
+
+def at_frac(ann, comp, frac):
+    """The same annotation with its tip pair moved to `frac` of the way along THIS frame's
+    shaft, on the mask's own chord there. Unchanged if the shaft cannot be walked.
+
+    The other half of station_frac, and the alternative to letting a tracker choose where
+    to measure: the station is re-derived from the mask every frame at the same fraction
+    along the arm, so it needs no texture to hold onto and cannot drift."""
+    got = _shaft(comp, ann.start, ann.u) if comp is not None else None
+    if got is None:
+        return ann
+    # the station is measured along the axis, not counted in chords: the walk samples every
+    # SHAFT_STEP px, and snapping the station to that grid would quantise the reading and
+    # let it hop a whole step whenever the shaft end moved slightly
+    last = got[0][-1]
+    s, u = np.asarray(ann.start, np.float64), ann.u
+    full = float((0.5 * (np.asarray(last[0]) + np.asarray(last[1])) - s) @ u)
+    if full < 1.0:
+        return ann
+    c = chord_at(comp, s + float(np.clip(frac, 0.0, 1.0)) * full * u, ann.n)
+    if c is None or c[2] < MIN_DIAM_PX:
+        return ann
+    pts = pair_up(list(ann.pts[:2]) + [c[0], c[1]])
+    ann.pts[2], ann.pts[3] = pts[2], pts[3]
+    return ann
 
 
 def entry_drift(prev, cur):
@@ -663,13 +860,20 @@ def _chain(d, frames, keep, manual, start, tol=STEP_TOL, gap_max=STEP_GAP_MAX):
     return sorted(dropped)
 
 
+def _window(n, want=SMOOTH_WIN, frac=WINDOW_FRAC):
+    """How many neighbouring measurements the local median may span, on an annotation of
+    n of them. Never more than 1/frac of it: a window that covers the whole clip is the
+    global median wearing a rolling median's clothes."""
+    return max(3, min(int(want), max(1, int(n) // int(frac))))
+
+
 def clip_scale(arm_by_frame, window=SMOOTH_WIN, k=OUTLIER_MAD, calib=1.0):
-    """Reconcile every frame's diameter against the rest of the clip.
+    """Decide which frames to export, and what each of them exports.
 
     Writes two things onto each ArmMeasure and returns a summary:
 
-      ann.clip_diameter   the diameter to EXPORT -- the local median of the neighbouring
-                          frames' readings, times calib. None where the frame has none.
+      ann.export_px       what this frame exports: its OWN diameter, times calib. None
+                          where the frame has none.
       ann.trusted         whether this frame is exported at all. A frame has to pass two
                           tests: it must agree with its NEIGHBOURS (the outlier test, for
                           noise) and it must not have JUMPED away from the last frame
@@ -677,21 +881,29 @@ def clip_scale(arm_by_frame, window=SMOOTH_WIN, k=OUTLIER_MAD, calib=1.0):
                           staying off). Frames whose verdict you gave yourself (trusted_by
                           == 'user') are left exactly as you left them either way.
 
+    The neighbours decide WHETHER, never WHAT. Each frame's scale is paired with that
+    frame's depth map, so a neighbourhood median would be handing a depth estimator the
+    scale of a different moment -- and on a camera that is moving it would smooth away
+    exactly the change the reference exists to record. Measured on a real 9-frame clip:
+    the hand-drawn ruler showed the scene coming 9.9% closer over those frames, the arm's
+    own readings showed 5.0% of it, and the smoothed export showed 0.8%.
+
     calib is a single multiplier for the whole clip -- the one knob for a mask that is
     systematically fat or thin, which no per-frame geometry can see. 1.0 leaves the
     measurement alone."""
     frames = sorted(t for t, a in arm_by_frame.items() if a is not None and a.measured)
     summary = {'n_measured': len(frames), 'n_exported': 0, 'n_rejected': 0,
                'median_px': 0.0, 'mm_per_px': 0.0, 'scatter_px': 0.0, 'scatter_pct': 0.0,
-               'raw_scatter_pct': 0.0, 'calib': float(calib),
+               'raw_scatter_pct': 0.0, 'calib': float(calib), 'window': 0,
                'n_broken': 0, 'break_at': None, 'anchor': None}
     for a in arm_by_frame.values():
         if a is not None:
-            a.clip_diameter = None
+            a.export_px = None
     if not frames:
         return summary
     d = np.array([arm_by_frame[t].diameter for t in frames], float)
-    med = _local_median(d, window)
+    win = _window(len(frames), window)
+    med = _local_median(d, win)
     resid = np.abs(d - med)
     mad = float(np.median(resid))
     tol = np.maximum(max(k * mad, OUTLIER_FLOOR_PX), OUTLIER_FLOOR_FRAC * med)
@@ -701,14 +913,14 @@ def clip_scale(arm_by_frame, window=SMOOTH_WIN, k=OUTLIER_MAD, calib=1.0):
     manual = [arm_by_frame[t].manual for t in frames]
     start = _anchor(manual)
     broke = _chain(d, frames, keep, manual, start)
-    summary.update(n_broken=len(broke), anchor=frames[start],
+    summary.update(n_broken=len(broke), anchor=frames[start], window=win,
                    break_at=frames[broke[0]] if broke else None)
-    for t, m, ok in zip(frames, med, keep):
+    for t, own, ok in zip(frames, d, keep):
         ann = arm_by_frame[t]
-        ann.clip_diameter = float(m) * float(calib)
+        ann.export_px = float(own) * float(calib)
         if ann.trusted_by != 'user':          # your own answer is never overruled
             ann.trusted = bool(ok)
-    used = med[keep] * float(calib)
+    used = d[keep] * float(calib)
     summary.update(n_exported=int(sum(1 for t in frames if arm_by_frame[t].trusted)),
                    n_rejected=int((~keep).sum()),
                    median_px=float(np.median(used)) if used.size else 0.0,
@@ -837,6 +1049,49 @@ if __name__ == '__main__':
     assert ann.end[0] < 200, f'tip pair walked into the jaws: {ann.end}'
     assert abs(ann.mm_per_px - ARM_MM / ann.diameter) < 1e-9
 
+    # THE CORNERS. A segmentation does not draw the arm meeting the border at an angle,
+    # it draws a curve into it, so the ends of the mask's border run sit well inside the
+    # real corner -- and the deeper the rounding, the further in. The sides are straight
+    # though, so fitting them and following them out of the picture puts the corner back.
+    def curved(w=400, h=400, y0=200, half=45, shaft=340, r=25, dy=0.0):
+        # an arm entering the left border whose two corners are CURVES, not angles
+        m = np.zeros((h, w), np.uint8)
+        for x in range(shaft):
+            off = r - np.sqrt(max(0.0, r * r - (r - x) ** 2)) if x < r else 0.0
+            yc = y0 + dy * x
+            m[int(yc - half + off):int(yc + half - off) + 1, x] = ARM_OBJECT_ID
+        return m
+
+    for r in (15, 40):
+        for dy in (0.0, -0.4):
+            m = curved(r=r, dy=dy)
+            raw = sorted(q[1] for q in border_pair(pick_component(arm_pixels(m))))
+            fit = sorted(q[1] for q in measure_frame(m).pts[:2])
+            want = (155.0, 245.0)          # where the un-rounded silhouette meets x = 0
+            assert max(abs(q - t) for q, t in zip(raw, want)) >= r - 1, 'scene not rounded'
+            assert max(abs(q - t) for q, t in zip(fit, want)) < 2.0, (r, dy, fit)
+
+    # ... and it does not need to be told WHICH border: an arm crossing an image corner
+    # has one side leaving through one border and the other through the other, which is
+    # the case a single border run gets most wrong (it puts a corner at the image corner,
+    # 50 px from the truth in this scene).
+    ang = np.deg2rad(205.0)
+    u_c = np.array([np.cos(ang), np.sin(ang)])
+    n_c = np.array([-u_c[1], u_c[0]])
+    base = np.array([399.0, 399.0])
+    yy, xx = np.mgrid[0:400, 0:400]
+    d_along = (xx - base[0]) * u_c[0] + (yy - base[1]) * u_c[1]
+    d_across = np.abs((xx - base[0]) * n_c[0] + (yy - base[1]) * n_c[1])
+    round_off = np.where(d_along < 30, 30 - np.sqrt(np.maximum(
+        0.0, 900 - (30 - np.clip(d_along, 0, 30)) ** 2)), 0.0)
+    m = (((d_along >= 0) & (d_along <= 360) & (d_across <= 45 - round_off))
+         * ARM_OBJECT_ID).astype(np.uint8)
+    truth = [_exit(base + 200 * u_c + side * 45 * n_c, -u_c, m.shape) for side in (1, -1)]
+    got = list(measure_frame(m).pts[:2])
+    worst = max(min(float(np.hypot(q[0] - t[0], q[1] - t[1])) for t in truth) for q in got)
+    assert worst < 2.0, (got, truth)
+    assert sorted(edge_of(q, m.shape) for q in got) == [1, 3], 'one corner per border'
+
     # the two sides must not cross, whichever border the arm comes in from. e0 pairs with
     # t0 and e1 with t1, so both have to sit on the SAME side of the centerline -- an arm
     # entering from the right used to come out with its side lines drawn in an X.
@@ -899,15 +1154,64 @@ if __name__ == '__main__':
     assert bot.moved_to([(103.0, 232.0), (123.0, 231.0), (110.0, 70.0), (130.0, 70.0)],
                         shape=shape).pts[0] == (103.0, 239.0)
 
+    # the arm comes closer, so it gets WIDER -- and a tracker carrying the tip pair along
+    # cannot see that, because a cylinder's edges say nothing along their length. The
+    # mask does, and snap_width is what reads it: same tracked station, this frame's width
+    wide = np.zeros((240, 320), np.uint8)
+    for x in range(200):
+        wide[105:136, x] = ARM_OBJECT_ID                       # 31 px across, was 21
+    carried = measure_frame(scene()).moved_to([(0.0, 110.0), (0.0, 130.0),
+                                               (180.0, 110.0), (180.0, 130.0)])
+    assert abs(carried.diameter - 20.0) < 0.01, carried.diameter
+    snapped = snap_width(carried, pick_component(arm_pixels(wide)))
+    assert abs(snapped.diameter - 31) < 2, snapped.diameter     # ... and now it is 31
+    assert snapped.mm_per_px < 0.01 + ARM_MM / 31 * 1.05
+    # a tip that has drifted off the mask keeps what the tracker gave, rather than
+    # inventing a width from whatever else is under it
+    off = measure_frame(scene()).moved_to([(0.0, 110.0), (0.0, 130.0),
+                                           (300.0, 20.0), (300.0, 40.0)])
+    assert snap_width(off, pick_component(arm_pixels(wide))).pts == off.pts
+
+    # THE TWO TRACKING MODES, on the same arm. 'points' lets the tracker choose where
+    # along the arm to measure; 'shaft' pins the station at a fraction of the way along
+    # and re-derives it from the mask, so it needs no texture and cannot slide.
+    tap = np.zeros((240, 320), np.uint8)                # a tapering arm: 30 px at the
+    for x in range(220):                                # border, 16 px at the far end
+        half = (30 - 14.0 * x / 220) / 2
+        tap[int(120 - half):int(120 + half) + 1, x] = ARM_OBJECT_ID
+    tcomp = pick_component(arm_pixels(tap))
+    base = measure_frame(tap)
+    f = station_frac(base, tcomp)
+    assert f is not None and 0.9 < f <= 1.0, f          # the guess ends AT the shaft end
+    # halfway along reads a width between the two ends, and reading it twice is stable
+    half_way = at_frac(measure_frame(tap), tcomp, 0.5)
+    assert 16 < half_way.diameter < 30, half_way.diameter
+    assert abs(at_frac(measure_frame(tap), tcomp, 0.5).diameter - half_way.diameter) < 1e-9
+    # the fraction round-trips: put the station at 0.5, ask where it is, get 0.5 back
+    assert abs(station_frac(half_way, tcomp) - 0.5) < 0.06, station_frac(half_way, tcomp)
+    # and it is monotone -- further along a tapering arm is narrower
+    widths = [at_frac(measure_frame(tap), tcomp, q).diameter for q in (0.2, 0.5, 0.8)]
+    assert widths[0] > widths[1] > widths[2], widths
+    # a station pinned by fraction does not care that the tracker's tip has slid: the
+    # same fraction on the same mask gives the same reading whatever the tip was doing
+    slid = measure_frame(tap)
+    slid.pts[2] = (slid.pts[2][0] - 60, slid.pts[2][1])
+    slid.pts[3] = (slid.pts[3][0] - 60, slid.pts[3][1])
+    assert abs(at_frac(slid, tcomp, 0.5).diameter - half_way.diameter) < 1.0
+
     # the entry pair's speed limit: it slides a few px a frame, so a big step is the
     # tracker having let go. Measured on the pair only -- the tip is free to move.
     base = measure_frame(scene())
-    crept = base.moved_to([(0.0, 113.0), (0.0, 133.0), (250.0, 60.0), (250.0, 200.0)],
-                          shape=shape)
-    assert entry_drift(base, crept) == 3.0, entry_drift(base, crept)
-    assert entry_drift(base, crept) < ENTRY_DRIFT_PX      # a big tip move is not a let-go
-    jumped = base.moved_to([(0.0, 150.0), (0.0, 133.0), (180.0, 110.0), (180.0, 130.0)],
-                           shape=shape)
+    e0, e1 = base.pts[0], base.pts[1]
+
+    def slid(de0, de1, tip=((250.0, 60.0), (250.0, 200.0))):
+        return base.moved_to([(e0[0], e0[1] + de0), (e1[0], e1[1] + de1)] + list(tip),
+                             shape=shape)
+
+    crept = slid(3.0, -1.0)             # ... and a big tip move is not a let-go
+    assert abs(entry_drift(base, crept) - 3.0) < 1e-6, entry_drift(base, crept)
+    assert entry_drift(base, crept) < ENTRY_DRIFT_PX
+    jumped = slid(40.0, 0.0, ((180.0, 110.0), (180.0, 130.0)))
     assert entry_drift(base, jumped) > ENTRY_DRIFT_PX, entry_drift(base, jumped)
 
     # the clip: one frame measuring something else is dropped, the rest are exported
@@ -921,6 +1225,32 @@ if __name__ == '__main__':
     clip[3].toggle(False)
     clip_scale(clip)
     assert not clip[3].trusted and clip[3].trusted_by == 'user'
+
+    # WHAT a frame exports is its own reading, never its neighbours'. The neighbours only
+    # decide WHETHER. This is the whole point of the reference: one scale per frame, to be
+    # paired with that frame's depth map, so a camera moving in must come out in the log.
+    zoom = {}
+    for t in range(24):
+        a = measure_frame(scene())
+        x, y = a.pts[2]
+        a.pts[2] = (x, y - 0.02 * t * a.diameter)      # the arm coming steadily closer
+        zoom[t] = a
+    raw = [zoom[t].diameter for t in range(24)]
+    clip_scale(zoom)
+    out = [zoom[t].export_diameter for t in range(24)]
+    assert out == raw, 'the export must be the frame own reading, unsmoothed'
+    assert len(set(round(v, 3) for v in out)) == 24, 'every frame its own number'
+    trend = 100 * (out[-1] - out[0]) / out[0]
+    assert trend > 30, f'a real zoom has to survive the export, got {trend:.1f}%'
+    # ... and CALIB is the one thing that does scale it, whole-clip
+    clip_scale(zoom, calib=1.10)
+    assert all(abs(zoom[t].export_diameter - 1.10 * raw[t]) < 1e-9 for t in range(24))
+
+    # the outlier window never spans the annotation: with 9 frames a 15-frame "rolling"
+    # median is the global one, which is what made a short clip export a single constant
+    assert _window(9, 15) == 3 and _window(30, 15) == 10 and _window(300, 15) == 15
+    assert _window(2, 15) == 3, 'a floor, so the median always has something to say'
+    assert clip_scale({t: measure_frame(scene()) for t in range(9)})['window'] == 3
 
     # THE continuity chain. A tracker that jumps at frame 12 and never comes back takes
     # its neighbours with it, so the rolling median is happy from 12 on -- only the STEP

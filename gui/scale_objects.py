@@ -108,7 +108,9 @@ class ScaleLine:
         ts = DEFAULT_TS if ts is None else ts
         self.ts = [float(np.clip(t, 0.0, 1.0)) for t in ts]
         self.source = source     # 'manual' (user keyframe) | 'tracked' | 'hold' (lost) |
-                                 # 'measured' (the arm's own chord)
+                                 # 'measured' (the arm's own chord). The arm's per-frame
+                                 # record carries a finer one -- 'tracked' vs 'shaft' says
+                                 # which TRACK mode wrote it -- under 'robot_arm'.
         self.conf = float(conf)  # [0,1] mean probe trust behind this fit (1 if manual)
 
     def copy(self, **kw):
@@ -312,7 +314,7 @@ def draw(img, lines, editing=False, pending=(), pending_color=(255, 255, 255),
 
 
 def save(workspace, by_frame, class_mm=None, width=None, height=None,
-         arm_by_frame=None, arm_seed=None, arm_calib=1.0):
+         arm_by_frame=None, arm_seed=None, arm_calib=1.0, arm_track='points'):
     """Persist the annotations to <workspace>/scale_objects.json.
 
     by_frame is {frame_index: {class_id: ScaleLine}} for the hand-drawn references;
@@ -353,7 +355,16 @@ def save(workspace, by_frame, class_mm=None, width=None, height=None,
     arm = {'mm': robot_arm.ARM_MM, 'object_id': robot_arm.ARM_OBJECT_ID,
            'seed': None if arm_seed is None else list(arm_seed),
            'calibration': float(arm_calib),
-           'smooth_window': robot_arm.SMOOTH_WIN,
+           # every class-3 record under 'frames' is that frame's OWN measurement, times
+           # the calibration -- never a neighbourhood average. The neighbours decide only
+           # WHICH frames are exported (robot_arm.clip_scale), over a window of at most
+           # this many measured frames and never more than a third of the annotation.
+           'smoothing': 'none (per-frame)',
+           'outlier_window_max': robot_arm.SMOOTH_WIN,
+           # which TRACK mode is selected. Each frame's own record says which mode wrote
+           # IT ('source'), so a clip tracked half one way and half the other is still
+           # readable -- this is only what the next run will use.
+           'track_mode': str(arm_track),
            'frames': {str(ti): arm_by_frame[ti].to_dict() for ti in sorted(arm_by_frame)}}
     with open(path.join(workspace, SCALE_FILE), 'w') as f:
         json.dump({'version': 2, 'n_track_points': N_TRACK, 'focal_px': FOCAL_PX,
@@ -363,8 +374,8 @@ def save(workspace, by_frame, class_mm=None, width=None, height=None,
 
 
 def load(workspace):
-    """(by_frame, class_mm, arm_by_frame, arm_seed, arm_calib) from the workspace. Missing
-    or unreadable file -> empty annotations and the built-in class defaults.
+    """(by_frame, class_mm, arm_by_frame, arm_seed, arm_calib, arm_track) from the
+    workspace. Missing or unreadable file -> empty annotations and the built-in defaults.
 
     Class 3 is never returned in by_frame: the arm is owned by arm_by_frame, and the
     class-3 records under 'frames' are its export, regenerated on every save. An arm
@@ -374,7 +385,7 @@ def load(workspace):
     defaults = {cid: float(spec['mm']) for cid, spec in CLASSES.items()}
     file = path.join(workspace, SCALE_FILE)
     if not path.exists(file):
-        return {}, defaults, {}, None, 1.0
+        return {}, defaults, {}, None, 1.0, 'points'
     try:
         with open(file) as f:
             data = json.load(f)
@@ -399,10 +410,11 @@ def load(workspace):
         seed = arm.get('seed')
         return (by_frame, defaults, arm_by_frame,
                 None if seed is None else tuple(seed),
-                float(arm.get('calibration', 1.0) or 1.0))
+                float(arm.get('calibration', 1.0) or 1.0),
+                'shaft' if arm.get('track_mode') == 'shaft' else 'points')
     except (ValueError, KeyError, TypeError, IndexError) as e:
         print(f'[scale_objects] could not read {file}: {e}')
-        return {}, defaults, {}, None, 1.0
+        return {}, defaults, {}, None, 1.0, 'points'
 
 
 def anchors(workspace, focal_px=None):
@@ -536,18 +548,18 @@ if __name__ == '__main__':
 
     # save/load roundtrip: per-frame per-class, edited ruler mm, derived fields present
     import tempfile
-    empty = ({}, {1: 10.0, 2: 16 / 3, 3: 8.0}, {}, None, 1.0)
+    empty = ({}, {1: 10.0, 2: 16 / 3, 3: 8.0}, {}, None, 1.0, 'points')
     with tempfile.TemporaryDirectory() as d:
         assert load(d) == empty                                    # nothing saved yet
         ruler = ScaleLine(1, (5, 5), (105, 5), mm=20.0, source='tracked', conf=0.42)
         cath = ScaleLine(2, (10, 40), (60, 90))
         save(d, {7: {1: ruler, 2: cath}, 9: {}}, class_mm={1: 20.0},
              width=320, height=240)
-        back, mms, arms, seed, calib = load(d)
+        back, mms, arms, seed, calib, track = load(d)
         assert list(back) == [7] and sorted(back[7]) == [1, 2]     # empty frame dropped
         assert mms[1] == 20.0 and mms[2] == 16 / 3
         assert arms == {} and seed is None
-        assert calib == 1.0                           # defaults for a fresh file
+        assert calib == 1.0 and track == 'points'     # defaults for a fresh file
         b1 = back[7][1]
         assert b1.mm == 20.0 and b1.source == 'tracked' and abs(b1.conf - 0.42) < 1e-4
         assert b1.a == ruler.a and b1.b == ruler.b and b1.ts == ruler.ts
@@ -565,10 +577,11 @@ if __name__ == '__main__':
         off = robot_arm.ArmMeasure([(0, 92), (0, 108), (60, 92), (60, 108)], manual=True)
         off.toggle(False)
         save(d, {7: {1: ruler}}, class_mm={1: 20.0}, width=320, height=240,
-             arm_by_frame={7: good, 8: off}, arm_seed=(12, 34), arm_calib=1.05)
-        back, _, arms, seed, calib = load(d)
+             arm_by_frame={7: good, 8: off}, arm_seed=(12, 34), arm_calib=1.05,
+             arm_track='shaft')
+        back, _, arms, seed, calib, track = load(d)
         assert seed == (12.0, 34.0) and sorted(arms) == [7, 8]
-        assert abs(calib - 1.05) < 1e-9                             # the clip-level knob
+        assert abs(calib - 1.05) < 1e-9 and track == 'shaft'        # the clip-level knobs
         assert arms[7].trusted and not arms[8].trusted and arms[8].manual
         assert abs(arms[8].diameter - 16.0) < 1e-6                 # kept, just not exported
         assert 3 not in back.get(7, {}), 'the arm is owned by arm_by_frame, not by_frame'

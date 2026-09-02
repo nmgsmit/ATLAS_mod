@@ -225,6 +225,25 @@ class GUI(QWidget):
         self.arm_calib_box.setEnabled(False)
         self.arm_calib_box.valueChanged.connect(controller.on_arm_calib)
 
+        # Robot arm only: which of the two TRACK modes carries the arm. Both track the two
+        # entry points; they disagree about what should decide WHERE along the arm the
+        # diameter is read, and the honest answer is that it depends on the footage -- so
+        # both are here to be run against each other on the same clip. Each frame records
+        # which mode wrote it, so the two logs can be told apart afterwards.
+        self.arm_track_combo = QComboBox()
+        self.arm_track_combo.addItems(['Track: points', 'Track: shaft fraction'])
+        self.arm_track_combo.setToolTip(
+            'Robot arm, TRACK only. "points": the tracker carries the two tip points as '
+            'well, and the width is read off the mask wherever they land -- it follows a '
+            'real place on the arm, but they sit on the smooth featureless edges of a '
+            'cylinder and can slide along it. "shaft fraction": the station is recorded as '
+            'a fraction of the way along the shaft when you start the run, and put back at '
+            'that fraction on every frame using that frame own mask -- nothing to lose '
+            'grip on, but it leans on the shaft end being found consistently. Re-run TRACK '
+            'after switching.')
+        self.arm_track_combo.setEnabled(False)
+        self.arm_track_combo.currentTextChanged.connect(controller.on_arm_track_mode)
+
         # GUI-bar boxes (gui/gui_bar.py): junk the extraction script missed, covered by
         # hand. Armed rather than always-on, so a drag can never draw a box while a
         # reference is being placed.
@@ -519,6 +538,7 @@ class GUI(QWidget):
         mm_row.addWidget(self.arm_trust_check)
         mm_row.addWidget(QLabel('Calib:'))
         mm_row.addWidget(self.arm_calib_box)
+        mm_row.addWidget(self.arm_track_combo)
         scale_shape_layout.addLayout(mm_row)
         scale_shape_layout.addWidget(self.scale_info_label)
         self.scale_shape_box = QGroupBox('Reference size')
@@ -851,8 +871,16 @@ class GUI(QWidget):
 
         ux, uy = self.pixel_pos_to_image_pos(event.position().x(), event.position().y())
         out_of_bound = (ux < 0) or (uy < 0) or (ux > self.w - 1) or (uy > self.h - 1)
-        # only the arch tool may act outside the image (its tip can sit past the border)
-        if out_of_bound and not getattr(self.controller, 'arch_mode', False):
+        # A click outside the image is allowed for the tools that have something sensible
+        # to do with one, and dropped for the rest so a stray click off the canvas cannot
+        # paint. The arch's tip legitimately sits past the border. A polygon vertex clamps
+        # onto the edge at the height you clicked (ex/ey below), which is how you enclose
+        # something running off the frame: aiming at the border itself means landing a
+        # pixel inside it or missing the canvas entirely, so the region never quite reaches
+        # the edge and leaves a seam of background behind.
+        outside_ok = (getattr(self.controller, 'arch_mode', False)
+                      or getattr(self.controller, 'in_polygon_mode', False))
+        if out_of_bound and not outside_ok:
             return
 
         ex = max(0, min(self.w - 1, ux))

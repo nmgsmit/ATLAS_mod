@@ -150,7 +150,7 @@ class MainController():
         # {frame: {class_id: ScaleLine}}, per-class mm, {frame: ArmMeasure}, and the seed
         # click that says WHICH instrument is the arm.
         (self.scale_by_frame, self.scale_mm, self.arm_by_frame, self.arm_seed,
-         self.arm_calib) = scale_objects.load(self.res_man.workspace)
+         self.arm_calib, self.arm_track) = scale_objects.load(self.res_man.workspace)
         # the clip-level reconciliation: what is actually exported, and the summary the
         # readout shows. Rebuilt from the per-frame measurements, never persisted.
         self._arm_summary = None
@@ -1031,7 +1031,7 @@ class MainController():
     def _save_scales(self):
         scale_objects.save(self.res_man.workspace, self.scale_by_frame, self.scale_mm,
                            self.w, self.h, self.arm_by_frame, self.arm_seed,
-                           self.arm_calib)
+                           self.arm_calib, self.arm_track)
 
     def on_scale_class(self, cls_id: int):
         """Pick the reference the clicks and keys apply to (buttons / keys 1-3 / [ ])."""
@@ -1187,6 +1187,8 @@ class MainController():
         self.gui.arm_measure_btn.setEnabled(arm)
         self.gui.arm_calib_box.setEnabled(arm)
         self.gui.arm_calib_box.setValue(float(self.arm_calib))
+        self.gui.arm_track_combo.setEnabled(arm)
+        self.gui.arm_track_combo.setCurrentIndex(1 if self.arm_track == 'shaft' else 0)
         ann = self.arm_by_frame.get(self.curr_ti) if arm else None
         self.gui.arm_trust_check.setChecked(bool(ann is not None and ann.trusted))
         self._syncing_scale = False
@@ -1226,14 +1228,12 @@ class MainController():
             return f'Robot arm: the four points are too close together here{tally}'
         by = 'you' if ann.trusted_by == 'user' else 'auto'
         state = f'ON ({by})' if ann.trusted else f'OFF ({by})'
-        # the raw reading is shown only when the clip has moved it, and then as a delta:
-        # that difference IS the per-frame noise, and it is the one number that tells you
-        # whether the segmentation on this frame is worth looking at
-        drift = ''
-        if ann.clip_diameter and abs(ann.clip_diameter - ann.diameter) > 0.05:
-            drift = (f'  (raw {ann.diameter:.1f}, '
-                     f'{ann.clip_diameter - ann.diameter:+.1f} from neighbours)')
-        placed = {'manual': '  HAND-PLACED', 'tracked': '  tracked',
+        # the uncalibrated reading is shown only where CALIB has moved it, so the knob's
+        # effect on this frame is visible rather than buried in one number
+        drift = ('' if abs(self.arm_calib - 1.0) < 1e-9 else
+                 f'  (raw {ann.diameter:.1f} px, calib x{self.arm_calib:g})')
+        placed = {'manual': '  HAND-PLACED', 'tracked': '  tracked (points)',
+                  'shaft': '  tracked (shaft fraction)',
                   'hold': '  HELD (tracking lost its grip)'}.get(ann.source, '')
         return (f'Robot arm: {ann.export_diameter:.1f} px = {robot_arm.ARM_MM:g} mm  '
                 f'({ann.export_mm_per_px:.4f} mm/px){drift}{placed}  '
@@ -1302,6 +1302,32 @@ class MainController():
         self._arm_reconcile()
         self._save_scales()
         self._draw_scale_overlay()
+
+    def on_arm_track_mode(self, mode: str):
+        """Pick which of the two TRACK modes carries the arm. Both track the entry pair;
+        they differ in what decides WHERE along the arm the diameter is read.
+
+        points   the tracker carries the tip pair too, and the mask is asked for the width
+                 wherever it landed. Follows a physical place on the arm, but it is
+                 following two patches on the smooth featureless edges of a cylinder, so
+                 the station can slide.
+        shaft    the station is a FRACTION along the shaft, recorded when the run is seeded
+                 and re-derived from each frame's own mask. Needs no texture and cannot
+                 slide; costs you the assumption that the shaft end is found consistently.
+
+        A frame says which mode wrote it (its 'source'), so two runs can be compared
+        afterwards without having to remember which was which."""
+        if self._syncing_scale or self.propagating:
+            return
+        self.arm_track = 'shaft' if str(mode).lower().startswith('shaft') else 'points'
+        self._save_scales()
+        self.gui.text(
+            'Robot arm TRACK mode: SHAFT FRACTION -- the diameter is read at the same '
+            'fraction along the arm on every frame, off that frame\'s mask. Nothing to '
+            'lose grip on. Re-run TRACK to use it.' if self.arm_track == 'shaft' else
+            'Robot arm TRACK mode: POINTS -- the tracker carries the tip pair and the '
+            'width is read where it lands. Follows a real place on the arm, but the two '
+            'points sit on smooth edges and can slide. Re-run TRACK to use it.')
 
     def _draw_scale_overlay(self):
         self.compose_current_im()       # segments (and handles while editing) in compose
@@ -1427,9 +1453,19 @@ class MainController():
                              ' (There is no diameter here anyway: the four points are on '
                              'top of each other.)'))
 
+    def _arm_mask_comp(self, ti, ann):
+        """Frame ti's arm blob, identified by where this annotation already sits."""
+        return robot_arm.pick_component(
+            robot_arm.arm_pixels(self.res_man.get_mask(ti)), [ann.start, ann.end])
+
     def _arm_seed_track(self, ti, image):
-        """Start following the arm's four points from frame ti. False if there is no arm
-        annotated there to follow."""
+        """Start following the arm from frame ti. False if there is no arm annotated
+        there to follow.
+
+        Both modes track the two ENTRY points, which is what anchors the axis. They differ
+        in where the measurement is taken: 'points' lets the tracker carry the tip pair
+        too, 'shaft' records how far along the shaft the tip sits as a FRACTION and puts it
+        back at that fraction on every frame's own mask."""
         ann = self.arm_by_frame.get(ti)
         if ann is None:
             self._arm_state = None
@@ -1437,11 +1473,14 @@ class MainController():
         from gui import segmenter
         tracker = segmenter.PointTracker()
         tracker.init(image, ann.points())
+        frac = None
+        if self.arm_track == 'shaft':
+            frac = robot_arm.station_frac(ann, self._arm_mask_comp(ti, ann))
         # the slope of the two sides is taken from HERE and held for the whole run: the arm
         # is straight and rigid, so the frame the points were placed on is the one that
         # says which way its edges run (robot_arm.LOCK_SLOPE). Re-seeding on a keyframe
         # therefore adopts the slope you just drew, which is how a wrong one is corrected.
-        self._arm_state = {'tracker': tracker, 'ann': ann,
+        self._arm_state = {'tracker': tracker, 'ann': ann, 'frac': frac,
                            'dirs': robot_arm.side_dirs(ann) if robot_arm.LOCK_SLOPE
                            else None}
         return True
@@ -1453,16 +1492,19 @@ class MainController():
         A frame you placed by hand is a keyframe -- it is never overwritten, and the
         tracker re-seeds there, so a correction propagates from where you made it. A point
         the tracker lost is moved by however far the others went (the arm is rigid, so
-        that is the best available guess), and the entry pair is put back onto the image
-        border it belongs on.
+        that is the best available guess), the entry pair is put back onto the image
+        border it belongs on, and the tip pair is put back onto this frame's mask so the
+        diameter is measured rather than carried (robot_arm.snap_width).
 
-        The two sides are also put back onto the SLOPE they were seeded with: the arm is a
-        straight shaft that does not bend, so the tracker gets to move each side across the
-        arm and slide the tip along it, and nothing else. Without that, a pixel or two of
-        drift per point per frame -- unavoidable on a smooth shaft with no texture to lock
-        onto -- pivots the axis the diameter is read square to, and the reading walks away
-        over a clip. Drag a point to set a different slope; from that keyframe on it is the
-        one that is held (robot_arm.LOCK_SLOPE turns the whole thing off).
+        The two sides are also put back onto the SLOPE they were seeded with, before the
+        width is read: the arm is a straight shaft that does not bend, so the tracker gets
+        to slide a side across the arm and along it, and nothing else. Without that, a
+        pixel or two of drift per point per frame -- unavoidable on a smooth shaft with no
+        texture to lock onto -- pivots the axis, and the axis is what the mask's chord is
+        read square to below. An oblique chord across a cylinder is too wide, so the pivot
+        would show up as the arm quietly gaining millimetres over a clip. Drag a point to
+        set a different slope; from that keyframe on it is the one that is held
+        (robot_arm.LOCK_SLOPE turns the whole thing off).
 
         The run STOPS if the entry pair has moved further in one frame than the arm
         possibly could (robot_arm.ENTRY_DRIFT_PX). That is the tracker having let go, and
@@ -1497,6 +1539,17 @@ class MainController():
                     f'cannot move more than about {robot_arm.ENTRY_DRIFT_PX:g}. Frame '
                     f'{ti} was not written. Put the four points back on the arm there and '
                     'TRACK again from it.')
+        # Either way the WIDTH comes off this frame's mask, never carried along -- a
+        # tracker cannot see how far apart a cylinder's two smooth edges have got. The
+        # modes differ only in what picks the station:
+        #   points  the tracker did; the mask is asked for the width where it landed
+        #   shaft   the mask does, at the same fraction along the arm as on the seed frame
+        comp = self._arm_mask_comp(ti, ann)
+        if state['frac'] is None:
+            robot_arm.snap_width(ann, comp)
+        else:
+            robot_arm.at_frac(ann, comp, state['frac'])
+            ann.source = 'shaft' if len(good) == 4 else 'hold'
         ann.adopt_verdict(self.arm_by_frame.get(ti))
         self.arm_by_frame[ti] = ann
         state['ann'] = ann
@@ -1737,19 +1790,27 @@ class MainController():
             self.gui.text('TRACK: too little of the reference(s) is visible on this frame '
                           'to track (off-frame, or covered by instruments).')
             return
+        arm_mode = ''
         if arm_on:
             self._arm_seed_track(start, self.curr_image_np)
+            # say which mode is ACTUALLY running: 'shaft' needs a shaft it can walk on the
+            # seed frame, and without one it quietly becomes 'points' -- which would turn
+            # an A/B comparison into a comparison of the same thing twice
+            got_frac = (self._arm_state or {}).get('frac') is not None
+            arm_mode = ('points -- SHAFT FRACTION could not seed here'
+                        if self.arm_track == 'shaft' and not got_frac else
+                        'shaft fraction' if got_frac else 'points')
         if bars_on:
             self._bar_seed(start, self.curr_image_np)
         names = ', '.join([scale_objects.class_name(s['cls']) for s in self._scale_states]
-                          + (['Robot arm (four points)'] if arm_on else [])
+                          + ([f'Robot arm ({arm_mode})'] if arm_on else [])
                           + ([f'{len(self._bar_states)} GUI box(es)'] if bars_on else []))
         self.gui.text(f'TRACK {direction} from frame {start}: {names}. Click TRACK again '
                       'to pause; gray = lost grip, amber = the points disagreed. '
                       'Masks are not touched.'
-                      + (' The arm\'s four points are carried from THIS frame, so correct '
-                         'them here first -- and each frame keeps its own trust verdict, '
-                         'so scrub back through and turn off the ones you do not believe.'
+                      + (' The arm is carried from THIS frame, so correct it here first '
+                         '-- and each frame keeps its own trust verdict, so scrub back '
+                         'through and turn off the ones you do not believe.'
                          if arm_on else ''))
 
         step = -1 if direction == 'backward' else 1
@@ -2497,10 +2558,18 @@ class MainController():
         # scale_edit_points is deliberately NOT reset: it is a UI preference living in the
         # (reused) checkbox, and resetting it here would desync the two
         (self.scale_by_frame, self.scale_mm, self.arm_by_frame, self.arm_seed,
-         self.arm_calib) = scale_objects.load(self.res_man.workspace)
+         self.arm_calib, self.arm_track) = scale_objects.load(self.res_man.workspace)
         self._arm_state = None
         self._arm_summary = None
         self._arm_reconcile()
+
+        # GUI-bar boxes -- the new workspace's own, never the last clip's
+        self.bar_pending = None
+        self.bar_anchor = None
+        self._bar_states = []
+        self.bars_by_frame = gui_bar.load(self.res_man.workspace)
+        # bar_mode is deliberately NOT reset here: like scale_edit_points it lives in the
+        # (reused) COVER GUI checkbox, and resetting it would desync the two
 
         # polygon tool state
         self.polygon_points = []

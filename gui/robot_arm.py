@@ -35,8 +35,12 @@ across and only slides along it, whether you drag it or the tracker moves it. Ac
 edge is not a choice anybody gets to make, so nothing is allowed to make it.
 
 TRACK carries the four points with segmenter.PointTracker -- the same tracker the ruler
-and the catheter tip use -- and puts the entry pair back on its edges after each step. A
-frame you correct by hand is a keyframe: the tracker re-seeds there, and TRACK never
+and the catheter tip use -- and puts the entry pair back on its edges after each step. It
+also holds the two sides to the SLOPE they were placed with (LOCK_SLOPE): the arm is a
+straight rigid shaft, so the tracker may move each side across the arm and slide the tip
+along it, but it may not pivot a side, and a pixel of tracker drift over a long arm is a
+degree of pivot the arm never made. A frame you correct by hand is a keyframe: the tracker
+re-seeds there -- taking the slope you just drew as the new one -- and TRACK never
 overwrites it. The run STOPS the moment an entry point moves further in one frame than
 the arm possibly could (ENTRY_DRIFT_PX): the entry pair is the far end of a long rigid
 arm and slides a few pixels a frame at most, so a bigger step is the tracker having let
@@ -137,6 +141,19 @@ OUTLIER_FLOOR_FRAC = 0.10      # ... nor is this fraction of the local median, w
 ENTRY_DRIFT_PX = 8.0           # px one entry point may move between frames. Raise it for
                                # a clip with genuinely violent camera motion -- the number
                                # the run reports when it stops says how much it wanted.
+
+# The one thing a tracker is not allowed to have an opinion about: the SLOPE of the arm's
+# two edge lines. The arm is a straight rigid shaft, so each side is a line whose direction
+# is set the moment you place the four points, and everything after that is the arm sliding
+# and the camera closing in -- never the sides pivoting frame by frame. The four points sit
+# on a smooth shaft with nothing to lock onto along its length, so each drifts a pixel or
+# two a frame; a pixel of drift over a 200 px arm is a degree of rotation the arm never
+# made, and the diameter is read SQUARE to the axis those points define, so that degree
+# comes straight off the scale. Holding the slope costs nothing that is real: the height of
+# each side and how far along the tip sits are still the tracker's to say, which is all a
+# rigid arm can actually do on the screen.
+LOCK_SLOPE = True              # False tracks all four points free, as before -- for a clip
+                               # where the camera really does roll about the arm's axis
 
 # The continuity chain -- the test the neighbourhood one above cannot make. A rolling
 # median compares a frame with its neighbours, so it catches a frame that is noisy and
@@ -396,6 +413,50 @@ def on_edge(p, edge, shape):
     return [(0.0, y), (float(w - 1), y), (x, 0.0), (x, float(h - 1))][edge]
 
 
+def side_dirs(ann):
+    """The direction of each of the arm's two edge lines, entry -> tip: (d0, d1).
+
+    The slope the rest of the clip is held to. It belongs to the arm and to where the
+    camera is looking from, not to any one frame's tracking, so it is captured where the
+    four points were PLACED -- the frame you set up, or the last keyframe you corrected."""
+    return (_unit(np.asarray(ann.pts[2]) - np.asarray(ann.pts[0])),
+            _unit(np.asarray(ann.pts[3]) - np.asarray(ann.pts[1])))
+
+
+def hold_slope(pts, dirs, edges, shape):
+    """The four tracked points put back onto edge lines of the given directions.
+
+    Each side keeps its slope and gives up nothing else. The line is re-fitted to that
+    side's two tracked points -- a line of fixed direction through their midpoint, which is
+    the least-squares fit to two points -- so the tracker still says how far the side has
+    moved ACROSS the arm (the height) and how far along the shaft the tip sits, and only
+    the pivot it was never entitled to is removed.
+
+    The entry point then falls out of the geometry rather than being tracked at all: it is
+    where that line crosses the border the arm entered across, which is by construction
+    where that edge of the arm enters the picture. It is clamped into the frame, so an arm
+    whose side line leaves through a corner still lands on its border.
+
+    edges is the border index (edge_of) each entry point belongs to, one per side."""
+    out = [(float(p[0]), float(p[1])) for p in pts]
+    h, w = float(shape[0]), float(shape[1])
+    for i, (d, edge) in enumerate(zip(dirs, edges)):
+        d = _unit(d)
+        e = np.asarray(pts[i], np.float64)
+        t = np.asarray(pts[i + 2], np.float64)
+        c = 0.5 * (e + t)                       # the line: this direction, this height
+        axis, want = (0, (0.0, w - 1.0)[edge]) if edge < 2 else (1, (0.0, h - 1.0)[edge - 2])
+        if abs(d[axis]) > 1e-6:
+            hit = c + ((want - c[axis]) / d[axis]) * d
+        else:
+            hit = c + float((e - c) @ d) * d    # the side runs ALONG that border: keep the
+                                                # tracked position, projected onto the line
+        out[i] = on_edge(hit, edge, shape)
+        q = c + float((t - c) @ d) * d
+        out[i + 2] = (float(q[0]), float(q[1]))
+    return out
+
+
 # --- one frame's annotation -----------------------------------------------
 
 class ArmMeasure:
@@ -502,19 +563,29 @@ class ArmMeasure:
         """The four points as a list, for the tracker."""
         return list(self.pts)
 
-    def moved_to(self, pts, source='tracked', shape=None):
+    def moved_to(self, pts, source='tracked', shape=None, dirs=None):
         """The same annotation with its four points somewhere else -- what TRACK produces.
 
         Given shape (h, w), the entry pair is put back onto the edges THIS annotation's
         entry pair was on: the arm goes on entering the picture across the same border it
         crossed last frame, and a tracker is not entitled to an opinion about that.
 
+        Given dirs -- the two edge-line directions from side_dirs, captured where the
+        points were placed -- it is not entitled to an opinion about the SLOPE of the two
+        sides either: each side is put back on a line of its own locked direction, keeping
+        only the height and the tip's position along the shaft that the tracker found. See
+        hold_slope, and LOCK_SLOPE for why.
+
         The verdict does NOT travel: it belongs to the frame it was given on, and the
         caller carries the target frame's own with adopt_verdict."""
         pts = list(pts)
         if shape is not None:
-            for i in (0, 1):
-                pts[i] = on_edge(pts[i], edge_of(self.pts[i], shape), shape)
+            edges = [edge_of(self.pts[i], shape) for i in (0, 1)]
+            if dirs is not None:
+                pts = hold_slope(pts, dirs, edges, shape)
+            else:
+                for i in (0, 1):
+                    pts[i] = on_edge(pts[i], edges[i], shape)
         return ArmMeasure(pts, source=source)
 
     # --- the verdict ------------------------------------------------------
@@ -898,6 +969,65 @@ if __name__ == '__main__':
     bot = ArmMeasure([(100.0, 239.0), (120.0, 239.0), (110.0, 80.0), (130.0, 80.0)])
     assert bot.moved_to([(103.0, 232.0), (123.0, 231.0), (110.0, 70.0), (130.0, 70.0)],
                         shape=shape).pts[0] == (103.0, 239.0)
+
+    # THE slope lock: over a run the tracker may move each side ACROSS the arm and slide
+    # the tip ALONG it, and may not pivot it. Every point below has drifted a couple of px
+    # off in its own direction -- the two sides still come back on exactly the directions
+    # they were placed with, and the entry pair on the border it entered across.
+    lock = measure_frame(scene())
+    dirs = side_dirs(lock)
+    noisy = [(3.0, lock.pts[0][1] - 2.0), (2.0, lock.pts[1][1] + 1.0),
+             (lock.pts[2][0] + 2.0, lock.pts[2][1] - 3.0),
+             (lock.pts[3][0] - 2.0, lock.pts[3][1] + 3.0)]
+    held = lock.moved_to(noisy, shape=shape, dirs=dirs)
+    assert max(abs(float(a @ _perp(b))) for a, b in zip(side_dirs(held), dirs)) < 1e-9
+    assert held.pts[0][0] == 0.0 and held.pts[1][0] == 0.0, held.pts
+    free = lock.moved_to(noisy, shape=shape)
+    assert max(abs(float(a @ _perp(b))) for a, b in zip(side_dirs(free), dirs)) > 1e-3, \
+        'the free tracker keeps the pivot -- otherwise this test proves nothing'
+
+    # ... and it is not a freeze. The camera closing in genuinely widens the arm, and that
+    # comes through, because how far each side sits ACROSS the arm is still the tracker's
+    # to say -- only the direction it runs in is not.
+    wider = lock.moved_to([(0.0, lock.pts[0][1] - 2.0), (0.0, lock.pts[1][1] + 2.0),
+                           (lock.pts[2][0], lock.pts[2][1] - 2.0),
+                           (lock.pts[3][0], lock.pts[3][1] + 2.0)],
+                          shape=shape, dirs=dirs)
+    assert abs(wider.diameter - (lock.diameter + 4.0)) < 1e-6, wider.diameter
+    # the tip still slides freely ALONG the shaft, and a slide along it is not a reading
+    slid = lock.moved_to([lock.pts[0], lock.pts[1]]
+                         + [(lock.pts[2 + i][0] + 20.0 * dirs[i][0],
+                             lock.pts[2 + i][1] + 20.0 * dirs[i][1]) for i in (0, 1)],
+                         shape=shape, dirs=dirs)
+    assert abs(slid.diameter - lock.diameter) < 0.1, slid.diameter   # a tenth of a pixel:
+    # the two sides are held to their OWN directions, and a guessed pair is a few
+    # thousandths of a radian from parallel, so a shaft read 20 px longer picks up that
+    # much of its taper. The point is that sliding the tip does not move the READING.
+    assert slid.length_px > lock.length_px + 15.0
+
+    # WHY: sixty frames of ordinary sub-pixel tracker noise on a smooth shaft. Free, the
+    # sides have pivoted by degrees the arm never moved -- and the diameter is read square
+    # to the axis they define, so that pivot is scale error. Locked, they have not moved.
+    rng = np.random.default_rng(0)
+    a_free, a_lock = measure_frame(scene()), measure_frame(scene())
+    for _ in range(60):
+        j = rng.normal(0.0, 0.7, (4, 2))
+        a_free = a_free.moved_to([(q[0] + k[0], q[1] + k[1])
+                                  for q, k in zip(a_free.pts, j)], shape=shape)
+        a_lock = a_lock.moved_to([(q[0] + k[0], q[1] + k[1])
+                                  for q, k in zip(a_lock.pts, j)], shape=shape, dirs=dirs)
+    tilt_free = max(abs(float(a @ _perp(b))) for a, b in zip(side_dirs(a_free), dirs))
+    tilt_lock = max(abs(float(a @ _perp(b))) for a, b in zip(side_dirs(a_lock), dirs))
+    assert tilt_lock < 1e-9 and tilt_free > 0.01, (tilt_free, tilt_lock)
+
+    # an arm entering the bottom: the locked side line is intersected with THAT border, not
+    # with whichever one the tracked point drifted nearest to
+    up = ArmMeasure([(100.0, 239.0), (120.0, 239.0), (110.0, 80.0), (130.0, 80.0)])
+    ud = side_dirs(up)
+    got = up.moved_to([(103.0, 232.0), (123.0, 231.0), (113.0, 70.0), (133.0, 70.0)],
+                      shape=shape, dirs=ud)
+    assert got.pts[0][1] == 239.0 and got.pts[1][1] == 239.0, got.pts
+    assert max(abs(float(a @ _perp(b))) for a, b in zip(side_dirs(got), ud)) < 1e-9
 
     # the entry pair's speed limit: it slides a few px a frame, so a big step is the
     # tracker having let go. Measured on the pair only -- the tip is free to move.

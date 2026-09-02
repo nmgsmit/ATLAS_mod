@@ -1059,8 +1059,10 @@ class MainController():
                 'shaft end move freely; the centerline runs between the pairs and the '
                 'white scale line is the diameter, square to it, which is what gets '
                 'exported. 3) TRACK '
-                'carries the four points through the video (a frame you correct becomes a '
-                'keyframe), or MEASURE CLIP re-guesses every frame off its mask. Then: D '
+                'carries the four points through the video, holding the two sides to the '
+                'slope you set here and letting only their height and the tip slide (a '
+                'frame you correct becomes a keyframe, and its slope is the one held from '
+                'there on), or MEASURE CLIP re-guesses every frame off its mask. Then: D '
                 '(or right-click) drops a frame you do not believe, and CALIB is the one '
                 'knob for a segmentation that is fat or thin on EVERY frame -- the readout '
                 'compares the arm against your ruler where both are drawn.')
@@ -1435,7 +1437,13 @@ class MainController():
         from gui import segmenter
         tracker = segmenter.PointTracker()
         tracker.init(image, ann.points())
-        self._arm_state = {'tracker': tracker, 'ann': ann}
+        # the slope of the two sides is taken from HERE and held for the whole run: the arm
+        # is straight and rigid, so the frame the points were placed on is the one that
+        # says which way its edges run (robot_arm.LOCK_SLOPE). Re-seeding on a keyframe
+        # therefore adopts the slope you just drew, which is how a wrong one is corrected.
+        self._arm_state = {'tracker': tracker, 'ann': ann,
+                           'dirs': robot_arm.side_dirs(ann) if robot_arm.LOCK_SLOPE
+                           else None}
         return True
 
     def _arm_pass(self, ti, image):
@@ -1447,6 +1455,14 @@ class MainController():
         the tracker lost is moved by however far the others went (the arm is rigid, so
         that is the best available guess), and the entry pair is put back onto the image
         border it belongs on.
+
+        The two sides are also put back onto the SLOPE they were seeded with: the arm is a
+        straight shaft that does not bend, so the tracker gets to move each side across the
+        arm and slide the tip along it, and nothing else. Without that, a pixel or two of
+        drift per point per frame -- unavoidable on a smooth shaft with no texture to lock
+        onto -- pivots the axis the diameter is read square to, and the reading walks away
+        over a clip. Drag a point to set a different slope; from that keyframe on it is the
+        one that is held (robot_arm.LOCK_SLOPE turns the whole thing off).
 
         The run STOPS if the entry pair has moved further in one frame than the arm
         possibly could (robot_arm.ENTRY_DRIFT_PX). That is the tracker having let go, and
@@ -1473,7 +1489,7 @@ class MainController():
         pts = [r['pos'] if r['state'] != 'lost' else (np.asarray(p) + drift)
                for r, p in zip(res, state['ann'].points())]
         ann = state['ann'].moved_to(pts, 'tracked' if len(good) == 4 else 'hold',
-                                    shape=(self.h, self.w))
+                                    shape=(self.h, self.w), dirs=state.get('dirs'))
         moved = robot_arm.entry_drift(state['ann'], ann)
         if moved > robot_arm.ENTRY_DRIFT_PX:
             return (f'the robot arm let go at frame {ti} -- its entry point jumped '

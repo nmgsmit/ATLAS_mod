@@ -33,6 +33,13 @@ BOX = (289, 4, 1340, 1072)          # x, y, w, h -- the picture inside those rec
                                     # 4-1075; this sits 1 px inside that on the sides, so
                                     # no ringing or half-blended edge line survives.
 CROP_FILE = 'source_crop.json'      # written inside the workspace
+
+# The console's own status bar, drawn ON the picture, so it survives the crop above.
+# Geometry is code/scripts/gui_mask.py's fixed boxes, in source pixels. Blanked rather
+# than cropped off: 1340x1072 is exactly 5:4, which is the framing the depth model was
+# trained on, and cutting 56 rows would break it.
+GUI_BAR_TOP = 1024                  # y; everything below this is bar, full width
+GUI_TAB = (961, 1011, 1293, 1024)   # x0, y0, x1, y1 -- the tab sitting on top of the bar
 # --------------------------------------------------------------------------
 
 
@@ -47,6 +54,34 @@ def apply_crop(frame, box):
         return frame
     x, y, w, h = box
     return frame[y:y + h, x:x + w]
+
+
+def _gui_offset(size):
+    """(x, y) to subtract from the GUI boxes for a frame of this (w, h), or None when
+    this is not a frame we know. Two sizes qualify: the full recording, and one already
+    cropped to BOX -- some clips arrive with the side bars gone but the bar still on."""
+    if tuple(size) == SOURCE_SIZE:
+        return (0, 0)
+    if tuple(size) == BOX[2:]:
+        return BOX[:2]
+    return None
+
+
+def blank_gui(frame, box=None):
+    """Paint the console's bottom bar (and its tab) black, in place. Returns the frame.
+
+    Runs BEFORE apply_crop -- on a full recording the boxes are in source pixels; on a
+    clip already cropped to BOX they are shifted to match. Any other size is left alone,
+    same rule as crop_for.
+    """
+    off = _gui_offset((frame.shape[1], frame.shape[0]))
+    if off is None:
+        return frame
+    ox, oy = off
+    frame[GUI_BAR_TOP - oy:] = 0
+    x0, y0, x1, y1 = GUI_TAB
+    frame[y0 - oy:y1 - oy, x0 - ox:x1 - ox] = 0
+    return frame
 
 
 def describe(box, size):
@@ -109,6 +144,22 @@ if __name__ == '__main__':
     assert out.shape == (1072, 1340, 3)
     assert out.min() == 200, 'a bar or blended edge line survived the crop'
     assert apply_crop(frame, None) is frame
+
+    # the bar is gone after blanking, and the picture above it is untouched
+    frame = np.full((1080, 1920, 3), 200, np.uint8)
+    out = apply_crop(blank_gui(frame), crop_for(SOURCE_SIZE))
+    assert out[GUI_BAR_TOP - y:].max() == 0, 'bottom bar survived'
+    assert out[GUI_TAB[1] - y:GUI_TAB[3] - y, GUI_TAB[0] - x:GUI_TAB[2] - x].max() == 0
+    assert out[:GUI_TAB[1] - y].min() == 200, 'blanked into the picture'
+    assert out.shape == (1072, 1340, 3), 'blanking must not change the 5:4 framing'
+    small = np.full((720, 1280, 3), 200, np.uint8)
+    assert blank_gui(small).min() == 200, 'an unknown size must be left alone'
+
+    # a clip that arrives already cropped to BOX: side bars gone, GUI bar still on
+    pre = np.full((BOX[3], BOX[2], 3), 200, np.uint8)
+    assert crop_for((BOX[2], BOX[3])) is None, 'an already-cropped clip must not be cut again'
+    blank_gui(pre)
+    assert (pre == out).all(), 'pre-cropped clip must end up identical to the full one'
 
     assert describe(BOX, SOURCE_SIZE) == ('cut 289 left, 291 right, 4 top, 4 bottom px '
                                           'of black border: 1920x1080 -> 1340x1072')

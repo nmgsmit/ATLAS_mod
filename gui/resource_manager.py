@@ -62,7 +62,9 @@ class ResourceManager:
         self.workspace = cfg['workspace']
         self.max_size = cfg.get('max_overall_size', None)
         # Endoscope recordings are letterboxed; the padding is not picture. Cut once, at
-        # extraction, so nothing downstream ever sees it (gui/border_crop.py).
+        # extraction, so nothing downstream ever sees it (gui/border_crop.py) -- along
+        # with the console's status bar, which is drawn on the picture and so survives
+        # the crop.
         self.crop_borders = bool(cfg.get('crop_borders', True))
         self.palette = custom_palette
 
@@ -235,7 +237,7 @@ class ResourceManager:
                 if source_size is None:
                     source_size = (frame.shape[1], frame.shape[0])
                     box = self._crop_box(source_size, video)
-                frame = self._shrink(border_crop.apply_crop(frame, box))
+                frame = self._shrink(border_crop.apply_crop(border_crop.blank_gui(frame), box))
                 if out_size is None:
                     out_size = (frame.shape[1], frame.shape[0])
                 cv2.imwrite(path.join(self.image_dir, f'{frame_index:07d}.jpg'), frame)
@@ -262,7 +264,7 @@ class ResourceManager:
                     continue
                 if source_size is None:
                     source_size = (frame.shape[1], frame.shape[0])
-                frame = self._shrink(border_crop.apply_crop(frame, box))
+                frame = self._shrink(border_crop.apply_crop(border_crop.blank_gui(frame), box))
                 if out_size is None:
                     out_size = (frame.shape[1], frame.shape[0])
                 cv2.imwrite(path.join(self.image_dir, image_name), frame)

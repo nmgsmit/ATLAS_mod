@@ -17,6 +17,7 @@ color_palette = {
     3: (0, 0, 255),      # Dorsal venous plexus - Blue (venous)
     4: (0, 255, 0),      # Catheter - Green (foreign body, contrasts with tissue)
     5: (128, 128, 128),  # Non-anatomical - Gray (neutral, not tissue)
+    6: (255, 0, 0),      # Burned tissue - Red (cautery char)
 }
 
 custom_names = {
@@ -25,6 +26,7 @@ custom_names = {
     3: "Dorsal venous plexus",
     4: "Catheter",
     5: "Non-anatomical",
+    6: "Burned tissue",
 }
 
 custom_palette_np = np.array([color_palette.get(i, (0, 0, 0)) for i in range(len(custom_names)+1)])

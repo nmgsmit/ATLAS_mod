@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -70,6 +71,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # the project rather than a folder inside it, which is why more than one root is needed
 # at all: the recordings live next to the checkout, not in it.
 DEFAULT_VIDEO_ROOTS = ('raw_videos', 'raw-videos', '../data')
+
+# containers OpenCV can decode; anything else in a video folder is ignored
+VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv', '.mpg', '.mpeg', '.wmv', '.m4v', '.webm'}
 
 
 def _existing_dirs(candidates) -> list:
@@ -189,3 +193,79 @@ if __name__ == '__main__':
     assert workspace_name_for_video('/x/data/caseB/clip.mp4') == os.path.join('caseB', 'clip.mp4')
     assert workspace_name_for_video('/elsewhere/clip.mp4') == 'clip.mp4'
     print('ok')
+
+
+def video_for_workspace(workspace: str, workspace_root: str, roots) -> str:
+    """The source video a workspace was made from, or None if it cannot be found.
+
+    The workspace tree mirrors the video tree (workspace_name_for_video), so the
+    workspace path relative to workspace_root is the video path relative to its root --
+    that mapping just has to be walked backwards. Older workspaces were named flat (the
+    bare file name) or with '__' for the separators, so those two spellings are tried as
+    well before giving up.
+    """
+    if not workspace:
+        return None
+    try:
+        rel = Path(workspace).resolve().relative_to(Path(workspace_root).resolve())
+    except (ValueError, OSError):
+        rel = Path(Path(workspace).name)
+
+    candidates = [rel]
+    if '__' in rel.name:                       # legacy flattened-subfolder name
+        candidates.append(Path(*rel.name.split('__')))
+
+    for root in (roots or []):
+        for cand in candidates:
+            full = Path(root) / cand
+            if full.is_file():
+                return str(full)
+
+    # legacy flat workspace: only the file name survived, so look it up in the tree
+    for root in (roots or []):
+        for found in Path(root).rglob(rel.name):
+            if found.is_file():
+                return str(found)
+    return None
+
+
+def _natural_key(name: str):
+    """Sort key splitting digit runs out as numbers, so clip2 sorts before clip10."""
+    return [int(part) if part.isdigit() else part.lower()
+            for part in re.split(r'(\d+)', name)]
+
+
+def sibling_videos(video_path: str) -> list:
+    """Every video sitting in the same folder as `video_path`, in natural name order.
+
+    Natural (not plain lexicographic) so numbered clips run 2, 3, ... 10 rather than
+    10, 2, 3 -- the order the file browser shows and the order they were recorded in.
+    Case is ignored so the run does not split on a stray capital.
+    """
+    folder = Path(video_path).parent
+    if not folder.is_dir():
+        return []
+    vids = [str(folder / f.name) for f in folder.iterdir()
+            if f.is_file() and f.suffix.lower() in VIDEO_EXTS]
+    return sorted(vids, key=lambda p: _natural_key(Path(p).name))
+
+
+def neighbour_video(video_path: str, step: int = 1) -> str:
+    """The next (step=1) or previous (step=-1) video in the same folder.
+
+    None at either end of the folder, so the caller can say so rather than silently
+    wrapping around to a clip that was already annotated.
+    """
+    vids = sibling_videos(video_path)
+    try:
+        i = vids.index(str(Path(video_path)))
+    except ValueError:
+        try:
+            resolved = str(Path(video_path).resolve())
+            i = [str(Path(v).resolve()) for v in vids].index(resolved)
+        except (ValueError, OSError):
+            return None
+    j = i + step
+    if 0 <= j < len(vids):
+        return vids[j]
+    return None

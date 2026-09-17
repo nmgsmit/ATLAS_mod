@@ -1,3 +1,4 @@
+import os
 import functools
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from gui import retzius_arch
 from gui import scale_objects
 from gui.cutie.utils.palette import custom_palette_np, custom_names
 from gui.gui_utils import *
-from gui.loader_dialog import LoaderDialog
+from gui.loader_dialog import LoaderDialog, _has_frames
 from gui.ritm import controller
 
 
@@ -67,6 +68,13 @@ class GUI(QWidget):
         self.open_button = QPushButton('Open... (O)')
         self.open_button.setToolTip('Load another raw video or an existing workspace')
         self.open_button.clicked.connect(self.open_loader)
+        # Straight to the next clip in the same folder -- the common case when working
+        # through a folder one video at a time, where the loader dialog is just friction.
+        self.next_video_button = QPushButton('Next video (N)')
+        self.next_video_button.setToolTip(
+            'Open the next video in the folder the current one came from')
+        # lambda, not the bound method: clicked() emits a bool that would land in `step`
+        self.next_video_button.clicked.connect(lambda: self.open_next_video(1))
         self.play_button = QPushButton('Play video')
         self.play_button.clicked.connect(self.on_play_video)
         # Playback speed: preview only. Multiplies the play frame-rate; it does NOT change
@@ -470,7 +478,8 @@ class GUI(QWidget):
             return box
 
         # --- always-visible groups (top row) ---
-        clip_box = make_group('Clip', [self.open_button, self.lcd, self.frame_name])
+        clip_box = make_group('Clip', [self.open_button, self.next_video_button,
+                                       self.lcd, self.frame_name])
         frame_box = make_group('Frame', [self.prev_frame_button, self.next_frame_button,
                                          self.play_button, QLabel('Speed:'),
                                          self.play_speed_combo])
@@ -723,6 +732,8 @@ class GUI(QWidget):
 
         # open another video / workspace shortcut
         QShortcut(QKeySequence(Qt.Key.Key_O), self).activated.connect(self.open_loader)
+        QShortcut(QKeySequence(Qt.Key.Key_N), self).activated.connect(
+            lambda: self.open_next_video(1))
 
         # quit shortcut
         QShortcut(QKeySequence(Qt.Key.Key_Q), self).activated.connect(self.close)
@@ -1054,6 +1065,58 @@ class GUI(QWidget):
                               extra_video_roots=self.cfg.get('extra_video_roots'))
         if dialog.exec() and dialog.selection:
             self.controller.load_workspace(**dialog.selection)
+
+    def current_video(self):
+        """The raw video the open workspace was made from, or None if it is not known.
+
+        `cfg['video']` only holds a path when this session was started from a raw video;
+        opening an already-imported clip goes through the workspace instead, so the video
+        has to be recovered from the workspace path in that case.
+        """
+        roots = video_roots(self.cfg.get('raw_videos_root'),
+                            self.cfg.get('extra_video_roots'))
+        video = self.cfg.get('video')
+        if video and os.path.isfile(video):
+            return video
+        return video_for_workspace(self.cfg.get('workspace'),
+                                   self.cfg.get('workspace_root', './workspace'),
+                                   roots)
+
+    def open_next_video(self, step: int = 1):
+        """Load the next video in the current one's folder, skipping the loader dialog.
+
+        Resolves to an existing workspace when the next clip has already been imported --
+        exactly what picking it in the loader would do -- so this never re-decodes a clip
+        that was annotated before.
+        """
+        if getattr(self.controller, 'propagating', False):
+            self.text('Stop propagation before opening another video.')
+            return
+
+        current = self.current_video()
+        if current is None:
+            self.text('Cannot tell which folder this workspace came from -- use Open... instead.')
+            return
+
+        nxt = neighbour_video(current, step)
+        if nxt is None:
+            where = 'last' if step > 0 else 'first'
+            self.text(f'This is the {where} video in {os.path.dirname(current)}.')
+            return
+
+        roots = video_roots(self.cfg.get('raw_videos_root'),
+                            self.cfg.get('extra_video_roots'))
+        workspace_root = self.cfg.get('workspace_root', './workspace')
+        root = root_for_video(nxt, roots)
+        for ws in (workspace_path_for_video(nxt, workspace_root, root),
+                   legacy_workspace_path_for_video(nxt, workspace_root, root)):
+            if ws and _has_frames(ws):
+                self.text(f'Opening {os.path.basename(nxt)} (existing workspace)...')
+                self.controller.load_workspace(workspace=ws)
+                return
+
+        self.text(f'Opening {os.path.basename(nxt)} -- extracting frames, please wait.')
+        self.controller.load_workspace(video=nxt)
 
     def rebind_workspace(self, h, w, T, workspace):
         """Re-point the (reused) widgets at a freshly loaded workspace: new frame count,

@@ -22,12 +22,9 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QW
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtCore import Qt
 
-from gui.gui_utils import (legacy_workspace_path_for_video, root_for_video, video_roots,
-                           workspace_path_for_video)
+from gui.gui_utils import (VIDEO_EXTS, legacy_workspace_path_for_video, root_for_video,
+                           video_roots, workspace_path_for_video)
 from gui.scale_objects import CLASSES as SCALE_CLASSES
-
-# containers OpenCV can decode; anything else in raw_videos is ignored by the browser
-VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv', '.mpg', '.mpeg', '.wmv', '.m4v', '.webm'}
 
 _IMPORTED_BRUSH = QBrush(QColor(80, 190, 120))   # green  -- already has extracted frames
 _NEW_BRUSH = QBrush(QColor(150, 150, 150))       # grey   -- not imported yet

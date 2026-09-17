@@ -129,6 +129,13 @@ class MainController():
         self._arch_current = None       # the arch being carried through that run
         self._arch_us = None            # its probes' arc parameters
         self._arch_holds = 0            # consecutive frames the probes lost the tissue
+        self._arch_shaky = 0            # consecutive frames the fit held but fell below trust
+        self._arch_stop = None          # why the last run ended, set by _arch_step
+        # The stop rule, live-editable from the Arch tracking group so it can be tuned
+        # against a clip instead of guessed: a run ends once the fit's confidence stays
+        # under arch_stop_conf for arch_stop_frames frames in a row.
+        self.arch_stop_conf = retzius_arch.LOW_CONF
+        self.arch_stop_frames = retzius_arch.STOP_CONF_FRAMES
         self.arch_by_frame = retzius_arch.load(self.res_man.workspace)  # {frame: Arch}
 
         # Scale-reference tool state (Mode -> "Scale annotation"; gui/scale_objects.py).
@@ -806,6 +813,7 @@ class MainController():
         self._arch_us = np.asarray(us)
         self._arch_current = arch
         self._arch_holds = 0
+        self._arch_shaky = 0
         return True
 
     def _arch_step(self, ti, image, blocked):
@@ -816,6 +824,7 @@ class MainController():
             if not self._arch_seed(keyframe, image, blocked):
                 self._arch_current = keyframe   # too hidden to re-seed; keep the old probes
                 self._arch_holds = 0
+                self._arch_shaky = 0
             return True
 
         res = self._arch_tracker.step(image, blocked)
@@ -834,6 +843,10 @@ class MainController():
         if cand is not None:
             self._arch_current = cand
             self._arch_holds = 0
+            # A fit that succeeded but scored low is the dangerous case: it looks like
+            # tracking, so nothing else catches it. Count it, and reset on the first
+            # confident frame so an isolated wobble is not treated as drift.
+            self._arch_shaky = self._arch_shaky + 1 if cand.conf < self.arch_stop_conf else 0
         else:
             self._arch_current = retzius_arch.Arch(self._arch_current.left,
                                                    self._arch_current.right,
@@ -841,8 +854,17 @@ class MainController():
                                                    source='hold', conf=0.0,
                                                    power=self._arch_current.power)
             self._arch_holds += 1
+            self._arch_shaky = 0        # 'lost' is the other counter's business
         self.arch_by_frame[ti] = self._arch_current
-        return self._arch_holds <= retzius_arch.MAX_HOLD_FRAMES
+        if self._arch_holds > retzius_arch.MAX_HOLD_FRAMES:
+            self._arch_stop = (f'lost the tissue for {self._arch_holds} frames')
+            return False
+        if self._arch_shaky >= self.arch_stop_frames:
+            self._arch_stop = (f'confidence stayed under {self.arch_stop_conf * 100:.0f}% '
+                               f'for {self._arch_shaky} frames '
+                               f'(last fit {self._arch_current.conf * 100:.0f}%)')
+            return False
+        return True
 
     def _set_track_lit(self, direction: Optional[str] = None):
         """Light the TRACK button that is running (None lights neither).
@@ -881,9 +903,11 @@ class MainController():
             return
         self.gui.text(f'TRACK {direction} from frame {start} with {len(self._arch_us)} probes. '
                       'Click TRACK again to pause; gray arc = lost grip, amber = probes '
-                      'disagreed. Masks are not touched.')
+                      f'disagreed. Stops after {self.arch_stop_frames} frames in a row '
+                      f'below {self.arch_stop_conf * 100:.0f}%. Masks are not touched.')
 
         step = -1 if direction == 'backward' else 1
+        self._arch_stop = None
         self.propagating = True            # blocks clicks/slider, like mask propagation
         self.arch_tracking = True
         self._arch_track_dir = direction
@@ -910,8 +934,9 @@ class MainController():
                 self.gui.progressbar_update(abs(t - start) / abs(last - start))
                 self.gui.process_events()
                 if not ok:
-                    stopped = (f'lost the tissue for {self._arch_holds} frames -- stopped at '
-                               f'frame {t}. Correct the arch there (ARCH) and TRACK again.')
+                    stopped = (f'{self._arch_stop} -- stopped at frame {t}. '
+                               'Correct the arch there (ARCH) and TRACK again, or lower '
+                               '"Stop below" to let it run through frames like this.')
                     break
         finally:
             self.propagating = False
@@ -981,6 +1006,22 @@ class MainController():
         arch.source = 'manual'
         self._update_arch_height_label(arch)
         self._draw_arch_overlay()
+
+    def on_arch_conf_slider(self, value):
+        """Trust floor for the stop rule, in percent (Arch tracking -> "Stop below").
+
+        Live during a run: _arch_step reads it every frame, so a run that is stopping too
+        eagerly can be rescued by dragging this down without restarting. Redraws too, so
+        the amber frames on screen always mean 'this one counts against the stop rule'.
+        """
+        self.arch_stop_conf = value / 100.0
+        self.gui.arch_conf_label.setText(f'Stop below: {value}%')
+        if not self.propagating:
+            self._draw_arch_overlay()
+
+    def on_arch_conf_frames(self, value):
+        """How many consecutive sub-threshold frames are tolerated before stopping."""
+        self.arch_stop_frames = int(value)
 
     def on_arch_height_released(self):
         # save once at the end of the gesture, not on every tick
@@ -1938,6 +1979,7 @@ class MainController():
         self.vis_image = self._apply_depth_overlay(self.vis_image)
         arch = self.arch_by_frame.get(self.curr_ti)
         retzius_arch.draw(self.vis_image, [arch] if arch is not None else [],
+                          low_conf=self.arch_stop_conf,
                           editing=self.arch_mode, pending=self.arch_pending)
         self._draw_scale(editing=self.scale_mode)
 
@@ -1966,7 +2008,8 @@ class MainController():
         # the frame's arc and references ride along during propagation/export too
         # (no editing handles)
         arch = self.arch_by_frame.get(self.curr_ti)
-        retzius_arch.draw(self.vis_image, [arch] if arch is not None else [])
+        retzius_arch.draw(self.vis_image, [arch] if arch is not None else [],
+                          low_conf=self.arch_stop_conf)
         self._draw_scale(editing=False)
         save_visualization = self.save_visualization_mode in [
             'Propagation only (higher quality)', 'Always'

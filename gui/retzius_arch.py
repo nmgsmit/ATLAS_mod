@@ -71,7 +71,17 @@ SIGMA_CEIL_FRAC = 0.08         # ceiling on that scale, as a fraction of the arc
                                # ceiling is the absolute veto: a probe this far off the arc it
                                # was on is rejected no matter how many others are equally off.
 MIN_EFF_PROBES = 2.0           # effective (weight-discounted) probes needed to fit at all
-LOW_CONF = 0.45                # below this the arc is drawn amber: tracked, but shaky
+LOW_CONF = 0.45                # default trust floor. Below it the arc is drawn amber
+                               # (tracked, but shaky) and the frame counts as unconfident
+                               # for the stop rule below. The GUI's "Stop below" slider
+                               # overrides it per run; this is only the value it starts at.
+# Giving up while still tracking. MAX_HOLD_FRAMES above covers the probes LOSING the
+# tissue; this covers the worse case where they keep a grip but stop agreeing -- the fit
+# still succeeds, it is just no longer worth trusting, so it would otherwise slide the
+# arch off the anatomy for the rest of the clip with nobody watching. A single shaky
+# frame is normal (an instrument sweeps past, the camera jerks), so the run only stops
+# once they come CONSECUTIVELY: one bad frame among good ones resets the count.
+STOP_CONF_FRAMES = 5           # consecutive sub-threshold frames before a run stops
 
 # Occluder (robot instrument) masking -- the third trust factor, alongside appearance
 # and agreement. There is nothing to see BEHIND an instrument; the mask does not
@@ -304,24 +314,29 @@ def _pt(p):
     return (int(round(p[0])), int(round(p[1])))
 
 
-def _arc_color(arch):
+def _arc_color(arch, low_conf=LOW_CONF):
     """Cyan = trusted, amber = tracked but the probes disagreed (nudge it),
-    gray = tracking lost the tissue and this frame is holding the last pose."""
+    gray = tracking lost the tissue and this frame is holding the last pose.
+
+    low_conf is the caller's live threshold, so amber marks exactly the frames that
+    count against the stop rule -- move the slider and the clip recolours to show what
+    the new setting would have stopped on."""
     source = getattr(arch, 'source', 'manual')
     if source == 'hold':
         return HOLD_COLOR
-    if source == 'tracked' and getattr(arch, 'conf', 1.0) < LOW_CONF:
+    if source == 'tracked' and getattr(arch, 'conf', 1.0) < low_conf:
         return SHAKY_COLOR
     return ARC_COLOR
 
 
-def draw(img, arches, editing=False, pending=()):
+def draw(img, arches, editing=False, pending=(), low_conf=LOW_CONF):
     """Draw the arcs onto img in place (cv2 clips anything off-image, incl. the tip).
-    editing adds drag handles + a mid-line cue; pending are the placement clicks."""
+    editing adds drag handles + a mid-line cue; pending are the placement clicks.
+    low_conf is the amber threshold (see _arc_color)."""
     if not isinstance(img, np.ndarray) or img.dtype != np.uint8 or img.ndim != 3:
         return  # e.g. torch tensor from the fast 'image' mode -- nothing to draw on
     for arch in arches:
-        arc_color = _arc_color(arch)
+        arc_color = _arc_color(arch, low_conf)
         pts = np.round(arch.points()).astype(np.int32)
         cv2.polylines(img, [pts], False, arc_color, THICKNESS, cv2.LINE_AA)
         if editing:
@@ -442,6 +457,12 @@ if __name__ == '__main__':
     assert _arc_color(Arch((0, 0), (10, 0), 5, 'tracked', 0.1)) == SHAKY_COLOR
     assert _arc_color(Arch((0, 0), (10, 0), 5, 'hold', 0.0)) == HOLD_COLOR
     assert _arc_color(Arch((0, 0), (10, 0), 5, 'manual', 1.0)) == ARC_COLOR
+    # the amber threshold follows the caller's slider, so what you see is what stops it
+    shaky = Arch((0, 0), (10, 0), 5, 'tracked', 0.5)
+    assert _arc_color(shaky, low_conf=0.45) == ARC_COLOR
+    assert _arc_color(shaky, low_conf=0.8) == SHAKY_COLOR
+    assert _arc_color(Arch((0, 0), (10, 0), 5, 'manual', 0.0), low_conf=1.0) == ARC_COLOR, \
+        'a hand-placed arch is never shaky, whatever the threshold'
 
     # hit test grabs the nearest handle
     assert hit_test([a], a.left[0] + 3, a.left[1] - 3, radius=8)[1] == 'left'

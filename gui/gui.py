@@ -123,6 +123,33 @@ class GUI(QWidget):
         self.reset_arch_button = QPushButton('RESET ARCH')
         self.reset_arch_button.clicked.connect(controller.on_reset_arch)
 
+        # When to give up: a TRACK run stops once the fit's confidence stays under
+        # "Stop below" for this many frames in a row. Both are live -- the tracking loop
+        # re-reads them every frame -- because the right threshold depends on the clip
+        # and is found by watching, not by guessing. The arc turns amber on exactly the
+        # frames that count, so dragging the slider over an already-tracked stretch shows
+        # what a given setting would have caught before committing to a re-run.
+        self.arch_conf_slider = QSlider(Qt.Orientation.Horizontal)
+        self.arch_conf_slider.setRange(0, 100)             # percent; 0 = never stop on trust
+        self.arch_conf_slider.setValue(int(round(retzius_arch.LOW_CONF * 100)))
+        self.arch_conf_slider.setMinimumWidth(120)
+        self.arch_conf_slider.setPageStep(5)
+        self.arch_conf_slider.setToolTip(
+            'Trust floor for the arch fit. Frames scoring below this are drawn amber and '
+            'count towards stopping the run. Lower = more tolerant, 0 = never stop on '
+            'confidence.')
+        self.arch_conf_slider.valueChanged.connect(controller.on_arch_conf_slider)
+        self.arch_conf_label = QLabel(f'Stop below: {int(round(retzius_arch.LOW_CONF * 100))}%')
+        self.arch_conf_label.setMinimumWidth(110)
+        self.arch_conf_frames = QSpinBox()
+        self.arch_conf_frames.setRange(1, 300)
+        self.arch_conf_frames.setValue(retzius_arch.STOP_CONF_FRAMES)
+        self.arch_conf_frames.setSuffix(' frames')
+        self.arch_conf_frames.setToolTip(
+            'How many frames in a row must score below the threshold before the run '
+            'stops. One shaky frame is normal; a run of them is drift.')
+        self.arch_conf_frames.valueChanged.connect(controller.on_arch_conf_frames)
+
         # Arch tip height: the tip is often off-image, where there is no handle to grab,
         # so drive the height scalar directly (drag or scroll the slider).
         self.arch_height_slider = QSlider(Qt.Orientation.Horizontal)
@@ -527,6 +554,15 @@ class GUI(QWidget):
         self.arch_track_box = make_group('Arch tracking', [self.reset_arch_button,
                                                            self.track_back_button,
                                                            self.track_fwd_button])
+        # The stop rule gets its own box rather than crowding the TRACK row: it is tuned
+        # while watching a run, not pressed like a button.
+        arch_stop_layout = QHBoxLayout()
+        arch_stop_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        for w in (self.arch_conf_label, self.arch_conf_slider,
+                  QLabel('for'), self.arch_conf_frames):
+            arch_stop_layout.addWidget(w)
+        self.arch_stop_box = QGroupBox('Stop when unsure')
+        self.arch_stop_box.setLayout(arch_stop_layout)
         arch_shape_layout = QHBoxLayout()
         arch_shape_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
         for w in (self.arch_height_label, self.arch_height_slider,
@@ -605,7 +641,8 @@ class GUI(QWidget):
 
         self.mode_stack = QStackedWidget()
         self.mode_stack.addWidget(make_page([self.class_box, self.edit_box], self.segment_box))
-        self.mode_stack.addWidget(make_page([self.arch_shape_box], self.arch_track_box))
+        self.mode_stack.addWidget(make_page([self.arch_shape_box, self.arch_stop_box],
+                                            self.arch_track_box))
         self.mode_stack.addWidget(make_page([self.scale_class_box, self.scale_shape_box,
                                              self.gui_bar_box],
                                             self.scale_track_box))

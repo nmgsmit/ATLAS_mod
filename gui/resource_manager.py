@@ -224,16 +224,35 @@ class ResourceManager:
         print(f'{path.basename(source)}: {border_crop.describe(box, source_size)}')
         return box
 
+    @staticmethod
+    def _ask_fps(video: str, source_fps: float) -> float:
+        """Ask how many fps to keep. No Qt app (headless) or cancel = keep every frame."""
+        from PySide6.QtWidgets import QApplication, QInputDialog
+        if QApplication.instance() is None or source_fps <= 0:
+            return source_fps
+        fps, ok = QInputDialog.getDouble(None, 'Extract frames',
+                                         f'{path.basename(video)} is {source_fps:.2f} fps.\n'
+                                         'Frames per second to load:',
+                                         source_fps, 0.1, source_fps, 2)
+        return fps if ok else source_fps
+
     def _extract_frames(self, video: str):
         cap = cv2.VideoCapture(video)
+        source_fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = self._ask_fps(video, source_fps)
+        read_index = 0
         frame_index = 0
         box = source_size = out_size = None
-        print(f'Extracting frames from {video} into {self.image_dir}...')
+        print(f'Extracting frames from {video} at {fps:.2f} fps into {self.image_dir}...')
         with tqdm() as bar:
             while (cap.isOpened()):
                 _, frame = cap.read()
                 if frame is None:
                     break
+                read_index += 1
+                # keep a frame only once the output clock has caught up to it
+                if fps < source_fps and frame_index > (read_index - 1) * fps / source_fps:
+                    continue
                 if source_size is None:
                     source_size = (frame.shape[1], frame.shape[0])
                     box = self._crop_box(source_size, video)
@@ -353,6 +372,20 @@ class ResourceManager:
                 return np.array(image)
 
         raise FileNotFoundError(f"No image found for {base_path} with supported extensions (.jpg, .png)")
+
+    def get_depth(self, ti: int):
+        """This frame's depth map as float [0,1], or None if there is none on disk.
+
+        Depth is only ever computed for a sample of frames, so a miss is the normal
+        case and not an error. Same layout save_depth writes, so a map computed in
+        the GUI and one imported by scripts/import_depth_maps.py read back alike.
+        """
+        assert 0 <= ti < self.length
+
+        depth_path = path.join(self.depth_dir, self.names[ti] + '.png')
+        if not path.exists(depth_path):
+            return None
+        return np.array(Image.open(depth_path)).astype(np.float32) / 255.0
 
     def _get_mask_unbuffered(self, ti: int):
         # returns H*W uint8 array

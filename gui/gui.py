@@ -371,6 +371,23 @@ class GUI(QWidget):
         self.combo.setCurrentText('mask overlay')
         self.combo.currentTextChanged.connect(controller.set_vis_mode)
 
+        # Depth overlay: a colourised depth map blended on top of whatever the View
+        # mode drew, so it composes with the mask overlay instead of replacing it.
+        # Only frames with a depth map on disk (<workspace>/depth) can show one.
+        self.depth_check = QCheckBox('Depth')
+        self.depth_check.setToolTip("Blend this frame's depth map over the view, if one "
+                                    "has been computed or imported for it.")
+        self.depth_check.stateChanged.connect(controller.on_depth_overlay)
+
+        self.depth_slider = QSlider(Qt.Orientation.Horizontal)
+        self.depth_slider.setMinimum(0)      # 0 = the frame alone
+        self.depth_slider.setMaximum(100)    # 100 = the depth map alone
+        self.depth_slider.setValue(50)
+        self.depth_slider.setMinimumWidth(120)
+        self.depth_slider.setToolTip('Depth opacity: 0% = image, 100% = depth map.')
+        self.depth_slider.valueChanged.connect(controller.on_depth_alpha)
+        self.depth_alpha_label = QLabel('50%')
+
         # Main canvas -> QLabel
         self.main_canvas = QLabel()
         self.main_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -458,7 +475,8 @@ class GUI(QWidget):
                                          self.play_button, QLabel('Speed:'),
                                          self.play_speed_combo])
         mode_box = make_group('Mode', [self.mode_combo])
-        view_box = make_group('View', [self.combo])
+        view_box = make_group('View', [self.combo, self.depth_check,
+                                      self.depth_slider, self.depth_alpha_label])
         progress_box = QGroupBox('Progress')
         progress_row = QHBoxLayout()
         progress_row.addWidget(self.progressbar)

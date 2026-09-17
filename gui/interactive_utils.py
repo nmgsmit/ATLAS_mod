@@ -79,13 +79,27 @@ def _depth_colormap(depth: np.ndarray) -> np.ndarray:
 
 
 def _blend_depth(base: np.ndarray, depth: np.ndarray, alpha: float = 0.5) -> np.ndarray:
-    # blend the depth colormap over base, but only where depth is valid (depth==0 is the
-    # masked border/overlay) so it stays as the underlying frame there
+    """Blend the depth colormap over `base` at `alpha` (0 = the frame, 1 = pure depth).
+
+    Only where depth is valid (depth==0 is the masked border/overlay), so those pixels
+    stay the underlying frame. The depth map may be stored at its own resolution, so
+    it is resized to the frame rather than assumed to match it.
+    """
+    if depth.shape[:2] != base.shape[:2]:
+        depth = cv2.resize(depth, (base.shape[1], base.shape[0]),
+                           interpolation=cv2.INTER_LINEAR)
+    if alpha <= 0:
+        return base
     out = base.copy()
     valid = depth > 0
     colored = _depth_colormap(depth)
     out[valid] = (base[valid] * (1 - alpha) + colored[valid] * alpha).astype(base.dtype)
     return out
+
+
+# the blend is also applied on top of whatever the View mode drew, driven by the
+# GUI's Depth toggle + opacity slider
+blend_depth = _blend_depth
 
 
 def get_visualization_torch(mode: Literal['image', 'mask', 'mask overlay'],

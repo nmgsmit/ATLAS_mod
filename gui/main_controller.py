@@ -104,6 +104,8 @@ class MainController():
         self.vis_image: np.ndarray = None
         self.curr_depth_map: np.ndarray = None
         self._depth_cache: dict = {}
+        self.depth_overlay: bool = False   # View > Depth checkbox
+        self.depth_alpha: float = 0.5      # its opacity slider, 0 = image .. 1 = depth
         self.save_visualization_mode: str = 'None'
         self.save_soft_mask: bool = False
 
@@ -1904,7 +1906,10 @@ class MainController():
     def load_current_image_mask(self, no_mask: bool = False):
         self.curr_image_np = self.res_man.get_image(self.curr_ti)
         self.curr_image_torch = None
+        # computed this session, else whatever was saved/imported for this frame
         self.curr_depth_map = self._depth_cache.get(self.curr_ti)
+        if self.curr_depth_map is None:
+            self.curr_depth_map = self.res_man.get_depth(self.curr_ti)
 
         if not no_mask:
             loaded_mask = self.res_man.get_mask(self.curr_ti)
@@ -1930,6 +1935,7 @@ class MainController():
             # 'image'-style modes return the cached frame itself; copy before any overlay
             # drawing scribbles into the frame cache (which also feeds the networks)
             self.vis_image = self.vis_image.copy()
+        self.vis_image = self._apply_depth_overlay(self.vis_image)
         arch = self.arch_by_frame.get(self.curr_ti)
         retzius_arch.draw(self.vis_image, [arch] if arch is not None else [],
                           editing=self.arch_mode, pending=self.arch_pending)
@@ -1956,6 +1962,7 @@ class MainController():
         if self.vis_image is self.curr_image_np:
             # some modes return the cached frame itself; copy before drawing on it
             self.vis_image = self.vis_image.copy()
+        self.vis_image = self._apply_depth_overlay(self.vis_image)
         # the frame's arc and references ride along during propagation/export too
         # (no editing handles)
         arch = self.arch_by_frame.get(self.curr_ti)
@@ -1988,6 +1995,28 @@ class MainController():
     def set_vis_mode(self):
         self.vis_mode = self.gui.combo.currentText()
         self.show_current_frame()
+
+    def _apply_depth_overlay(self, image: np.ndarray) -> np.ndarray:
+        """Blend the depth map over a rendered frame, if the Depth toggle is on and this
+        frame has one. Applied on top of the View mode so it composes with the mask
+        overlay; the depth-only View modes already colour the depth themselves."""
+        if not self.depth_overlay or self.curr_depth_map is None:
+            return image
+        if self.vis_mode in ('depth', 'depth overlay', 'mask + depth overlay'):
+            return image
+        return blend_depth(image, self.curr_depth_map, self.depth_alpha)
+
+    def on_depth_overlay(self, *_):
+        self.depth_overlay = self.gui.depth_check.isChecked()
+        if self.depth_overlay and self.curr_depth_map is None:
+            self.gui.text('No depth map for this frame -- only sampled frames have one.')
+        self.show_current_frame()
+
+    def on_depth_alpha(self, value: int):
+        self.depth_alpha = value / 100.0
+        self.gui.depth_alpha_label.setText(f'{value}%')
+        if self.depth_overlay:
+            self.show_current_frame()
 
     def save_current_mask(self):
         # save mask to hard disk
